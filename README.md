@@ -2,7 +2,7 @@
 
 This  repository contains the official implementation for the paper [Oscillatory State-Space Models](https://openreview.net/pdf?id=GRMfXcAAFh) by [T. Konstantin Rusch](https://konstantinrusch.com/) and [Daniela Rus](https://www.csail.mit.edu/person/daniela-rus).
 
-### ![NEW](https://img.shields.io/badge/NEW-red) For a complete JAX-based SSM library including LinOSS and other state-of-the-art SSM architectures, please check out our [linax library](https://github.com/camail-official/linax).
+### ![NEW](https://img.shields.io/badge/NEW-red) For a complete JAX-based SSM library including LinOSS and other state-of-the-art SSM architectures, please check out our [Discretax library](https://github.com/camail-official/discretax).
 
 --------------------
 We propose Linear Oscillatory State-Space models (LinOSS) for efficiently learning on long sequences. Inspired by cortical dynamics of biological neural networks, we base our proposed LinOSS model on a system of forced harmonic oscillators. A stable discretization, integrated over time using fast associative parallel scans, yields the proposed state-space model. 
