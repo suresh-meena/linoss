@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import time
+import hashlib
 
 import jax.random as jr
 import numpy as np
@@ -18,8 +19,12 @@ from models.generate_torch_model import create_torch_model
 
 def _key_to_seed(key) -> int:
     values = np.asarray(key, dtype=np.uint32)
-    combined = int((np.uint64(values[0]) << np.uint64(32)) | np.uint64(values[1]))
-    return combined % ((1 << 63) - 1)
+    if values.size < 2:
+        seed = np.uint32(values[0])
+    else:
+        # Map a 64-bit key to a 32-bit seed accepted by numpy/torch.
+        seed = np.uint32(values[0] ^ values[1])
+    return int(seed)
 
 
 def _prepare_output_dir(
@@ -62,15 +67,56 @@ def _build_output_dir(
     logsig_depth: int,
     model_args: dict,
 ) -> str:
-    output_dir = f"T_{T:.2f}_time_{include_time}_nsteps_{num_steps}_lr_{lr}"
+    def _format_value(value) -> str:
+        if isinstance(value, bool):
+            return str(value)
+        if isinstance(value, float):
+            return f"{value:g}"
+        return str(value)
+
+    def _abbrev_key(key: str) -> str:
+        aliases = {
+            "d_model": "dM",
+            "n_layers": "nL",
+            "d_state": "dS",
+            "expand": "x",
+            "d_head": "dH",
+            "d_conv": "dC",
+            "chunk_size": "cS",
+            "dropout": "do",
+            "ffn_mult": "ffM",
+            "dt_min": "dtMn",
+            "dt_max": "dtMx",
+            "dt_init_floor": "dtIF",
+            "r_min": "rMn",
+            "r_max": "rMx",
+            "theta_bound": "thB",
+            "k_max": "kMx",
+            "eps": "eps",
+        }
+        return aliases.get(key, key)
+
+    # Build a deterministic short output name that stays informative.
+    base = f"T{_format_value(T)}_time{_format_value(include_time)}_steps{num_steps}_lr{_format_value(lr)}"
     if model_name in {"log_ncde", "nrde"}:
-        output_dir += f"_stepsize_{stepsize:.2f}_depth_{logsig_depth}"
+        base += f"_stepsize{stepsize}_depth{logsig_depth}"
+
+    params = []
     for key, value in model_args.items():
-        name = str(value)
+        name = _format_value(value)
         if "(" in name:
             name = name.split("(", 1)[0]
-        output_dir += f"_{key}_{name}"
-    return output_dir + f"_seed_{seed}"
+        params.append(f"{_abbrev_key(key)}{name}")
+
+    full_name = f"{model_name}_{base}_{'_'.join(params)}_seed{seed}"
+
+    # Stay safely below common per-component filename limits.
+    if len(full_name) > 240:
+        digest = hashlib.sha256(full_name.encode("utf-8")).hexdigest()[:10]
+        compact_prefix = [model_name, base, *params[:4], f"seed{seed}"]
+        return f"{'_'.join(compact_prefix)}_{digest}"
+
+    return full_name
 
 
 def _make_loader(
