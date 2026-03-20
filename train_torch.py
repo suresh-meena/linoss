@@ -1,0 +1,346 @@
+"""Torch training entrypoint for raw sequence classification models."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import time
+
+import jax.random as jr
+import numpy as np
+import torch
+from torch.nn import functional as F
+from torch.utils.data import DataLoader
+
+from data_dir.torch_datasets import TorchDataset, create_torch_dataset
+from models.generate_torch_model import create_torch_model
+
+
+def _key_to_seed(key) -> int:
+    values = np.asarray(key, dtype=np.uint32)
+    combined = int((np.uint64(values[0]) << np.uint64(32)) | np.uint64(values[1]))
+    return combined % ((1 << 63) - 1)
+
+
+def _prepare_output_dir(output_dir: str) -> None:
+    if os.path.isdir(output_dir):
+        user_input = input(
+            f"Warning: Output directory {output_dir} already exists. "
+            "Do you want to delete it? (yes/no): "
+        )
+        if user_input.lower() == "yes":
+            shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
+            print(f"Directory {output_dir} has been deleted and recreated.")
+            return
+        raise ValueError(f"Directory {output_dir} already exists. Exiting.")
+
+    os.makedirs(output_dir)
+    print(f"Directory {output_dir} has been created.")
+
+
+def _build_output_dir(
+    *,
+    seed: int,
+    T: float,
+    include_time: bool,
+    num_steps: int,
+    lr: float,
+    model_name: str,
+    stepsize: int,
+    logsig_depth: int,
+    model_args: dict,
+) -> str:
+    output_dir = f"T_{T:.2f}_time_{include_time}_nsteps_{num_steps}_lr_{lr}"
+    if model_name in {"log_ncde", "nrde"}:
+        output_dir += f"_stepsize_{stepsize:.2f}_depth_{logsig_depth}"
+    for key, value in model_args.items():
+        name = str(value)
+        if "(" in name:
+            name = name.split("(", 1)[0]
+        output_dir += f"_{key}_{name}"
+    return output_dir + f"_seed_{seed}"
+
+
+def _make_loader(
+    dataset,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    drop_last: bool,
+    generator: torch.Generator | None = None,
+    pin_memory: bool,
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        drop_last=drop_last,
+        generator=generator,
+        num_workers=0,
+        pin_memory=pin_memory,
+    )
+
+
+def _infinite_batches(loader: DataLoader):
+    while True:
+        for batch in loader:
+            yield batch
+
+
+@torch.no_grad()
+def _evaluate_accuracy(model, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    for x, lengths, labels in loader:
+        x = x.to(device=device, non_blocking=True)
+        lengths = lengths.to(device=device, non_blocking=True)
+        labels = labels.to(device=device, non_blocking=True)
+        logits = model(x, lengths)
+        predictions = logits.argmax(dim=1)
+        correct += int((predictions == labels).sum().item())
+        total += int(labels.shape[0])
+    return float(correct / total)
+
+
+def _save_metrics(
+    output_dir: str,
+    print_steps: int,
+    all_train_metric: list[float],
+    all_val_metric: list[float],
+    all_time: list[float],
+    test_metric: float,
+) -> None:
+    steps = np.arange(0, len(all_train_metric) * print_steps, print_steps)
+    np.save(os.path.join(output_dir, "steps.npy"), steps)
+    np.save(
+        os.path.join(output_dir, "all_train_metric.npy"),
+        np.asarray(all_train_metric),
+    )
+    np.save(
+        os.path.join(output_dir, "all_val_metric.npy"),
+        np.asarray(all_val_metric),
+    )
+    np.save(os.path.join(output_dir, "all_time.npy"), np.asarray(all_time))
+    np.save(os.path.join(output_dir, "test_metric.npy"), np.asarray(test_metric))
+
+
+def _set_torch_seed(seed: int) -> None:
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def train_torch_model(
+    dataset: TorchDataset,
+    model,
+    *,
+    num_steps: int,
+    print_steps: int,
+    lr: float,
+    lr_scheduler,
+    batch_size: int,
+    shuffle_seed: int,
+    output_dir: str,
+    device: torch.device,
+):
+    if batch_size > len(dataset.train):
+        raise ValueError("Batch size larger than training dataset size.")
+
+    pin_memory = device.type == "cuda"
+    train_generator = torch.Generator()
+    train_generator.manual_seed(shuffle_seed)
+
+    train_loader = _make_loader(
+        dataset.train,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        generator=train_generator,
+        pin_memory=pin_memory,
+    )
+    train_eval_loader = _make_loader(
+        dataset.train,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        pin_memory=pin_memory,
+    )
+    val_loader = _make_loader(
+        dataset.val,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        pin_memory=pin_memory,
+    )
+    test_loader = _make_loader(
+        dataset.test,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        pin_memory=pin_memory,
+    )
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr_scheduler(lr))
+    train_batches = _infinite_batches(train_loader)
+
+    running_loss = 0.0
+    all_train_metric = [0.0]
+    all_val_metric = [0.0]
+    val_metric_for_best_model = [0.0]
+    best_test_metric = 0.0
+    no_val_improvement = 0
+    all_time = []
+    start = time.time()
+
+    for step in range(num_steps):
+        model.train()
+        x, lengths, labels = next(train_batches)
+        x = x.to(device=device, non_blocking=True)
+        lengths = lengths.to(device=device, non_blocking=True)
+        labels = labels.to(device=device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(x, lengths)
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        optimizer.step()
+        running_loss += float(loss.item())
+
+        if (step + 1) % print_steps != 0:
+            continue
+
+        train_metric = _evaluate_accuracy(model, train_eval_loader, device)
+        val_metric = _evaluate_accuracy(model, val_loader, device)
+        total_time = time.time() - start
+        print(
+            f"Step: {step + 1}, Loss: {running_loss / print_steps}, "
+            f"Train metric: {train_metric}, Validation metric: {val_metric}, "
+            f"Time: {total_time}"
+        )
+
+        if step > 0:
+            if val_metric <= max(val_metric_for_best_model):
+                no_val_improvement += 1
+                if no_val_improvement > 10:
+                    break
+            else:
+                no_val_improvement = 0
+
+        if val_metric >= max(val_metric_for_best_model):
+            val_metric_for_best_model.append(val_metric)
+            best_test_metric = _evaluate_accuracy(model, test_loader, device)
+            print(f"Test metric: {best_test_metric}")
+
+        running_loss = 0.0
+        all_train_metric.append(train_metric)
+        all_val_metric.append(val_metric)
+        all_time.append(total_time)
+        _save_metrics(
+            output_dir,
+            print_steps,
+            all_train_metric,
+            all_val_metric,
+            all_time,
+            best_test_metric,
+        )
+        start = time.time()
+
+    print(f"Test metric: {best_test_metric}")
+    _save_metrics(
+        output_dir,
+        print_steps,
+        all_train_metric,
+        all_val_metric,
+        all_time,
+        best_test_metric,
+    )
+    return model
+
+
+def create_dataset_model_and_train_torch(
+    seed,
+    data_dir,
+    use_presplit,
+    dataset_name,
+    output_step,
+    metric,
+    include_time,
+    T,
+    model_name,
+    stepsize,
+    logsig_depth,
+    linoss_discretization,
+    model_args,
+    num_steps,
+    print_steps,
+    lr,
+    lr_scheduler,
+    batch_size,
+    output_parent_dir="",
+    id=None,
+):
+    del output_step, stepsize, logsig_depth, linoss_discretization, id
+
+    if model_name != "SLinOSS":
+        raise ValueError(f"Unknown Torch training model: {model_name}")
+    if metric != "accuracy":
+        raise ValueError("SLinOSS Torch training currently supports accuracy only.")
+
+    from models.SLinOSS import ensure_slinoss_cuda_ready
+
+    ensure_slinoss_cuda_ready()
+    device = torch.device("cuda")
+
+    output_parent_dir = os.path.join(output_parent_dir, "outputs", model_name, dataset_name)
+    output_dir = _build_output_dir(
+        seed=seed,
+        T=T,
+        include_time=include_time,
+        num_steps=num_steps,
+        lr=lr,
+        model_name=model_name,
+        stepsize=1,
+        logsig_depth=1,
+        model_args=model_args,
+    )
+    full_output_dir = os.path.join(output_parent_dir, output_dir)
+
+    key = jr.PRNGKey(seed)
+    datasetkey, modelkey, trainkey, _ = jr.split(key, 4)
+    # Match the extra split performed inside the JAX dataloader path before shuffling batches.
+    shufflekey, _ = jr.split(trainkey)
+
+    print(f"Creating dataset {dataset_name}")
+    dataset = create_torch_dataset(
+        data_dir,
+        dataset_name,
+        use_presplit,
+        include_time,
+        T,
+        key=datasetkey,
+    )
+
+    print(f"Creating model {model_name}")
+    _set_torch_seed(_key_to_seed(modelkey))
+    model = create_torch_model(
+        model_name,
+        dataset.data_dim,
+        dataset.label_dim,
+        model_args=model_args,
+    ).to(device)
+
+    _prepare_output_dir(full_output_dir)
+    return train_torch_model(
+        dataset,
+        model,
+        num_steps=num_steps,
+        print_steps=print_steps,
+        lr=lr,
+        lr_scheduler=lr_scheduler,
+        batch_size=batch_size,
+        shuffle_seed=_key_to_seed(shufflekey),
+        output_dir=full_output_dir,
+        device=device,
+    )
