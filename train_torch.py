@@ -229,7 +229,7 @@ def train_torch_model(
     shuffle_seed: int,
     output_dir: str,
     device: torch.device,
-    mixed_precision: bool = True,
+    mixed_precision: bool = False,
 ):
     if batch_size > len(dataset.train):
         raise ValueError("Batch size larger than training dataset size.")
@@ -409,7 +409,7 @@ def create_dataset_model_and_train_torch(
     id=None,
     overwrite_output_dir: bool = False,
     auto_confirm_output_dir: bool = False,
-    mixed_precision: bool = True,
+    mixed_precision: bool = False,
     torch_compile: bool = False,
     torch_compile_mode: str = "reduce-overhead",
 ):
