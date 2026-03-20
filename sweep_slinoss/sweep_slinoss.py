@@ -164,22 +164,28 @@ def run_sweep(
     progress_position: int = 0,
 ) -> None:
     combinations = _iter_grid(HYPERPARAM_GRID)
-    total_grid_points = len(datasets) * len(combinations)
 
     if not show_progress:
         print(f"Total hyperparameter combinations: {len(combinations)}")
 
     base_configs: dict[str, dict] = {}
+    total_runs = 0
     for dataset_name in datasets:
         config_path = os.path.join(experiment_folder, "SLinOSS", f"{dataset_name}.json")
         with open(config_path, "r", encoding="utf-8") as file:
             base_config = json.load(file)
         base_configs[dataset_name] = base_config
+        effective_seeds = _resolve_seeds(
+            config=base_config,
+            seeds_per_config=seeds_per_config,
+            seeds=seeds,
+        )
+        total_runs += len(combinations) * len(effective_seeds)
 
     progress = None
     if show_progress and tqdm is not None:
         progress = tqdm(
-            total=total_grid_points,
+            total=total_runs,
             desc=progress_desc,
             position=progress_position,
             dynamic_ncols=True,
@@ -209,6 +215,8 @@ def run_sweep(
                 target_dir = _expected_output_path(seed, dataset_name, run_args)
                 if skip_existing and os.path.isdir(target_dir):
                     skipped_runs += 1
+                    if progress is not None:
+                        progress.update(1)
                     continue
                 try:
                     run_fn(
@@ -225,17 +233,20 @@ def run_sweep(
                         if not show_progress:
                             print(f"Skipping run after CUDA OOM (dataset={dataset_name}, seed={seed})")
                         _cleanup_after_oom(target_dir)
+                        if progress is not None:
+                            progress.update(1)
                         continue
                     if _is_nonfinite_training_error(exc):
                         nonfinite_failed_runs += 1
                         if not show_progress:
                             print(f"Skipping run after non-finite values (dataset={dataset_name}, seed={seed})")
                         _cleanup_after_oom(target_dir)
+                        if progress is not None:
+                            progress.update(1)
                         continue
                     raise
-            
-            if progress is not None:
-                progress.update(1)
+                if progress is not None:
+                    progress.update(1)
 
     if progress is not None:
         progress.close()
