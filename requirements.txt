@@ -1,0 +1,18 @@
+diffrax==0.6.1
+equinox==0.11.11
+jax==0.5.3
+jaxlib==0.5.3
+matplotlib==3.8.4
+numpy==1.26.4
+optax==0.2.6
+packaging==26.0
+pandas==2.2.3
+pre-commit==3.7.1
+scikit-learn==1.5.2
+scipy==1.17.1
+signax==0.1.1
+# Match the published slinoss CUDA release wheel for Linux x86_64 / CPython 3.11.
+torch==2.10.0
+slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.1.0/slinoss-0.1.0-cp311-cp311-linux_x86_64.whl#sha256=4bf1694a229eed9b8f0ab0da1453ba86f6bd09ea42a3c0b9930376ed8adf2323
+sktime==0.30.1
+tqdm==4.66.4
