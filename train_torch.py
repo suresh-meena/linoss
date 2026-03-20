@@ -271,7 +271,7 @@ def train_torch_model(
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_scheduler(lr))
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     train_batches = _infinite_batches(train_loader)
 
     running_loss = 0.0
