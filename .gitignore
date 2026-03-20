@@ -5,3 +5,6 @@ __pycache__/
 #Data files
 data_dir/raw/
 data_dir/processed/
+
+#results
+outputs/SLinOSS/
