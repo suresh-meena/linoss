@@ -47,6 +47,15 @@ DEFAULT_DATASETS = [
     "SelfRegulationSCP2",
 ]
 
+COMPLETION_MARKER = "_sweep_complete.json"
+REQUIRED_OUTPUT_FILES = (
+    "steps.npy",
+    "all_train_metric.npy",
+    "all_val_metric.npy",
+    "all_time.npy",
+    "test_metric.npy",
+)
+
 def _iter_grid(grid: dict[str, list]) -> list[dict[str, object]]:
     keys = tuple(grid.keys())
     values = tuple(grid[k] for k in keys)
@@ -95,6 +104,49 @@ def _expected_output_path(seed: int, dataset_name: str, run_args: dict) -> str:
         model_args=run_args["model_args"],
     )
     return os.path.join(output_parent_dir, output_dir)
+
+
+def _completion_marker_path(output_dir: str) -> str:
+    return os.path.join(output_dir, COMPLETION_MARKER)
+
+
+def _has_required_output_files(output_dir: str) -> bool:
+    return all(os.path.isfile(os.path.join(output_dir, filename)) for filename in REQUIRED_OUTPUT_FILES)
+
+
+def _is_completed_run(output_dir: str) -> bool:
+    marker_path = _completion_marker_path(output_dir)
+    if not os.path.isfile(marker_path):
+        return False
+    if not _has_required_output_files(output_dir):
+        return False
+
+    try:
+        with open(marker_path, "r", encoding="utf-8") as file:
+            marker = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+    return marker.get("status") == "complete"
+
+
+def _write_completion_marker(
+    output_dir: str,
+    *,
+    dataset_name: str,
+    seed: int,
+    run_args: dict,
+) -> None:
+    marker_path = _completion_marker_path(output_dir)
+    marker = {
+        "status": "complete",
+        "dataset_name": dataset_name,
+        "seed": seed,
+        "num_steps": int(run_args["num_steps"]),
+        "print_steps": int(run_args["print_steps"]),
+    }
+    with open(marker_path, "w", encoding="utf-8") as file:
+        json.dump(marker, file, indent=2, sort_keys=True)
 
 
 def _is_cuda_oom_error(exc: BaseException) -> bool:
@@ -240,18 +292,29 @@ def run_sweep(
                     emit_progress(delta)
 
                 target_dir = _expected_output_path(seed, dataset_name, run_args)
-                if skip_existing and os.path.isdir(target_dir):
+                run_already_completed = _is_completed_run(target_dir)
+
+                if skip_existing and run_already_completed:
                     skipped_runs += 1
                     emit_progress(1.0)
                     continue
+                overwrite_existing = os.path.isdir(target_dir) and (
+                    not skip_existing or not run_already_completed
+                )
                 try:
                     run_fn(
                         seed=seed,
-                        overwrite_output_dir=False,
+                        overwrite_output_dir=overwrite_existing,
                         auto_confirm_output_dir=False,
                         verbose=not (show_progress or progress_queue is not None),
                         progress_callback=report_run_progress,
                         **run_args,
+                    )
+                    _write_completion_marker(
+                        target_dir,
+                        dataset_name=dataset_name,
+                        seed=seed,
+                        run_args=run_args,
                     )
                     completed_runs += 1
                 except Exception as exc:
