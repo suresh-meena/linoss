@@ -43,7 +43,8 @@ def _run_on_gpu(
     import torch
 
     if not datasets:
-        print(f"[GPU {gpu_id}] No datasets assigned. Worker exiting.")
+        if not show_progress:
+            print(f"[GPU {gpu_id}] No datasets assigned. Worker exiting.")
         return
 
     if not torch.cuda.is_available():
@@ -57,11 +58,12 @@ def _run_on_gpu(
     torch.cuda.set_device(0)
     active_device = torch.cuda.current_device()
     device_name = torch.cuda.get_device_name(active_device)
-    print(
-        f"[GPU {gpu_id}] Using CUDA device cuda:{active_device} ({device_name}), "
-        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
-    )
-    print(f"[GPU {gpu_id}] Running datasets: {datasets}")
+    if not show_progress:
+        print(
+            f"[GPU {gpu_id}] Using CUDA device cuda:{active_device} ({device_name}), "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
+        )
+        print(f"[GPU {gpu_id}] Running datasets: {datasets}")
     run_sweep(
         experiment_folder=experiment_folder,
         datasets=datasets,
@@ -94,8 +96,9 @@ def run_two_gpu_sweep(
         )
 
     gpu0_datasets, gpu1_datasets = _split_datasets(datasets)
-    print(f"GPU {gpu_ids[0]} datasets: {gpu0_datasets}")
-    print(f"GPU {gpu_ids[1]} datasets: {gpu1_datasets}")
+    if not show_progress:
+        print(f"GPU {gpu_ids[0]} datasets: {gpu0_datasets}")
+        print(f"GPU {gpu_ids[1]} datasets: {gpu1_datasets}")
 
     workers = [
         mp.Process(

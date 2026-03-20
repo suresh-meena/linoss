@@ -164,27 +164,22 @@ def run_sweep(
     progress_position: int = 0,
 ) -> None:
     combinations = _iter_grid(HYPERPARAM_GRID)
-    print(f"Total hyperparameter combinations: {len(combinations)}")
+    total_grid_points = len(datasets) * len(combinations)
+
+    if not show_progress:
+        print(f"Total hyperparameter combinations: {len(combinations)}")
 
     base_configs: dict[str, dict] = {}
-    total_runs = 0
     for dataset_name in datasets:
         config_path = os.path.join(experiment_folder, "SLinOSS", f"{dataset_name}.json")
         with open(config_path, "r", encoding="utf-8") as file:
             base_config = json.load(file)
         base_configs[dataset_name] = base_config
 
-        effective_seeds = _resolve_seeds(
-            config=base_config,
-            seeds_per_config=seeds_per_config,
-            seeds=seeds,
-        )
-        total_runs += len(combinations) * len(effective_seeds)
-
     progress = None
     if show_progress and tqdm is not None:
         progress = tqdm(
-            total=total_runs,
+            total=total_grid_points,
             desc=progress_desc,
             position=progress_position,
             dynamic_ncols=True,
@@ -198,11 +193,6 @@ def run_sweep(
 
     for dataset_name in datasets:
         base_config = base_configs[dataset_name]
-
-        if progress is not None:
-            progress.set_description(f"{progress_desc}: {dataset_name}")
-        else:
-            print(f"\nDataset: {dataset_name}")
 
         for combo_idx, params in enumerate(combinations, start=1):
             run_config = _apply_sweep_params_to_config(base_config, params)
@@ -219,45 +209,44 @@ def run_sweep(
                 target_dir = _expected_output_path(seed, dataset_name, run_args)
                 if skip_existing and os.path.isdir(target_dir):
                     skipped_runs += 1
-                    if progress is not None:
-                        progress.update(1)
                     continue
                 try:
                     run_fn(
                         seed=seed,
                         overwrite_output_dir=False,
                         auto_confirm_output_dir=False,
+                        verbose=not show_progress,
                         **run_args,
                     )
                     completed_runs += 1
                 except Exception as exc:
                     if _is_cuda_oom_error(exc):
                         oom_failed_runs += 1
-                        print(f"Skipping run after CUDA OOM (dataset={dataset_name}, seed={seed})")
+                        if not show_progress:
+                            print(f"Skipping run after CUDA OOM (dataset={dataset_name}, seed={seed})")
                         _cleanup_after_oom(target_dir)
-                        if progress is not None:
-                            progress.update(1)
                         continue
                     if _is_nonfinite_training_error(exc):
                         nonfinite_failed_runs += 1
-                        print(f"Skipping run after non-finite values (dataset={dataset_name}, seed={seed})")
+                        if not show_progress:
+                            print(f"Skipping run after non-finite values (dataset={dataset_name}, seed={seed})")
                         _cleanup_after_oom(target_dir)
-                        if progress is not None:
-                            progress.update(1)
                         continue
                     raise
-                if progress is not None:
-                    progress.update(1)
+            
+            if progress is not None:
+                progress.update(1)
 
     if progress is not None:
         progress.close()
 
-    print(
-        f"{progress_desc} summary: completed={completed_runs}, skipped={skipped_runs}, "
-        f"oom_failed={oom_failed_runs}, "
-        f"nonfinite_failed={nonfinite_failed_runs}, "
-        f"total={total_runs}"
-    )
+    if not show_progress:
+        print(
+            f"{progress_desc} summary: completed={completed_runs}, skipped={skipped_runs}, "
+            f"oom_failed={oom_failed_runs}, "
+            f"nonfinite_failed={nonfinite_failed_runs}, "
+            f"total_runs={completed_runs + skipped_runs + oom_failed_runs + nonfinite_failed_runs}"
+        )
 
 
 if __name__ == "__main__":

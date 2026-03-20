@@ -33,12 +33,14 @@ def _prepare_output_dir(
     *,
     overwrite: bool = False,
     auto_confirm: bool = False,
+    verbose: bool = True,
 ) -> None:
     if os.path.isdir(output_dir):
         if overwrite or auto_confirm:
             shutil.rmtree(output_dir)
             os.makedirs(output_dir)
-            print(f"Directory {output_dir} has been deleted and recreated.")
+            if verbose:
+                print(f"Directory {output_dir} has been deleted and recreated.")
             return
 
         user_input = input(
@@ -48,12 +50,14 @@ def _prepare_output_dir(
         if user_input.lower() == "yes":
             shutil.rmtree(output_dir)
             os.makedirs(output_dir)
-            print(f"Directory {output_dir} has been deleted and recreated.")
+            if verbose:
+                print(f"Directory {output_dir} has been deleted and recreated.")
             return
         raise ValueError(f"Directory {output_dir} already exists. Exiting.")
 
     os.makedirs(output_dir)
-    print(f"Directory {output_dir} has been created.")
+    if verbose:
+        print(f"Directory {output_dir} has been created.")
 
 
 def _build_output_dir(
@@ -230,6 +234,7 @@ def train_torch_model(
     output_dir: str,
     device: torch.device,
     mixed_precision: bool = False,
+    verbose: bool = True,
 ):
     if batch_size > len(dataset.train):
         raise ValueError("Batch size larger than training dataset size.")
@@ -337,10 +342,11 @@ def train_torch_model(
 
         val_metric = _evaluate_accuracy(model, val_loader, device)
         total_time = time.time() - start
-        print(
-            f"Step: {step + 1}, Loss: {running_loss / print_steps}, "
-            f"Validation metric: {val_metric}, Time: {total_time}"
-        )
+        if verbose:
+            print(
+                f"Step: {step + 1}, Loss: {running_loss / print_steps}, "
+                f"Validation metric: {val_metric}, Time: {total_time}"
+            )
 
         all_train_metric.append(float("nan"))
         all_val_metric.append(val_metric)
@@ -374,7 +380,8 @@ def train_torch_model(
     if best_state_dict is not None:
         model.load_state_dict(best_state_dict)
     best_test_metric = _evaluate_accuracy(model, test_loader, device)
-    print(f"Test metric: {best_test_metric}")
+    if verbose:
+        print(f"Test metric: {best_test_metric}")
     _save_metrics(
         output_dir,
         print_steps,
@@ -412,6 +419,7 @@ def create_dataset_model_and_train_torch(
     mixed_precision: bool = False,
     torch_compile: bool = False,
     torch_compile_mode: str = "reduce-overhead",
+    verbose: bool = True,
 ):
     del output_step, stepsize, logsig_depth, linoss_discretization, id
 
@@ -444,7 +452,8 @@ def create_dataset_model_and_train_torch(
     # Match the extra split performed inside the JAX dataloader path before shuffling batches.
     shufflekey, _ = jr.split(trainkey)
 
-    print(f"Creating dataset {dataset_name}")
+    if verbose:
+        print(f"Creating dataset {dataset_name}")
     dataset = create_torch_dataset(
         data_dir,
         dataset_name,
@@ -454,7 +463,8 @@ def create_dataset_model_and_train_torch(
         key=datasetkey,
     )
 
-    print(f"Creating model {model_name}")
+    if verbose:
+        print(f"Creating model {model_name}")
     _set_torch_seed(_key_to_seed(modelkey))
     model = create_torch_model(
         model_name,
@@ -470,6 +480,7 @@ def create_dataset_model_and_train_torch(
         full_output_dir,
         overwrite=overwrite_output_dir,
         auto_confirm=auto_confirm_output_dir,
+        verbose=verbose,
     )
     return train_torch_model(
         dataset,
@@ -483,4 +494,5 @@ def create_dataset_model_and_train_torch(
         output_dir=full_output_dir,
         device=device,
         mixed_precision=mixed_precision,
+        verbose=verbose,
     )
