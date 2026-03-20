@@ -199,7 +199,11 @@ def run_sweep(
     for dataset_name in datasets:
         base_config = base_configs[dataset_name]
 
-        print(f"\nDataset: {dataset_name}")
+        if progress is not None:
+            progress.set_description(f"{progress_desc}: {dataset_name}")
+        else:
+            print(f"\nDataset: {dataset_name}")
+
         for combo_idx, params in enumerate(combinations, start=1):
             run_config = _apply_sweep_params_to_config(base_config, params)
 
@@ -214,20 +218,10 @@ def run_sweep(
             for seed in effective_seeds:
                 target_dir = _expected_output_path(seed, dataset_name, run_args)
                 if skip_existing and os.path.isdir(target_dir):
-                    print(
-                        "Skipping existing run "
-                        f"(combo {combo_idx}/{len(combinations)}): {target_dir}"
-                    )
                     skipped_runs += 1
                     if progress is not None:
                         progress.update(1)
                     continue
-
-                print(
-                    "Starting run "
-                    f"(combo {combo_idx}/{len(combinations)}), "
-                    f"dataset={dataset_name}, seed={seed}, params={params}"
-                )
                 try:
                     run_fn(
                         seed=seed,
@@ -239,24 +233,14 @@ def run_sweep(
                 except Exception as exc:
                     if _is_cuda_oom_error(exc):
                         oom_failed_runs += 1
-                        print(
-                            "Skipping run after CUDA OOM "
-                            f"(combo {combo_idx}/{len(combinations)}), "
-                            f"dataset={dataset_name}, seed={seed}, params={params}"
-                        )
-                        print(f"OOM details: {exc}")
+                        print(f"Skipping run after CUDA OOM (dataset={dataset_name}, seed={seed})")
                         _cleanup_after_oom(target_dir)
                         if progress is not None:
                             progress.update(1)
                         continue
                     if _is_nonfinite_training_error(exc):
                         nonfinite_failed_runs += 1
-                        print(
-                            "Skipping run after non-finite training values "
-                            f"(combo {combo_idx}/{len(combinations)}), "
-                            f"dataset={dataset_name}, seed={seed}, params={params}"
-                        )
-                        print(f"Non-finite details: {exc}")
+                        print(f"Skipping run after non-finite values (dataset={dataset_name}, seed={seed})")
                         _cleanup_after_oom(target_dir)
                         if progress is not None:
                             progress.update(1)
