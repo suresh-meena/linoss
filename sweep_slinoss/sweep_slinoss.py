@@ -32,6 +32,12 @@ HYPERPARAM_GRID = {
     "include_time": [True, False],
 }
 
+HEAD_DIMS_BY_HIDDEN_DIM = {
+    16: [16],
+    64: [16, 32],
+    128: [16, 32, 64],
+}
+
 DEFAULT_DATASETS = [
     "EigenWorms",
     "EthanolConcentration",
@@ -44,7 +50,15 @@ DEFAULT_DATASETS = [
 def _iter_grid(grid: dict[str, list]) -> list[dict[str, object]]:
     keys = tuple(grid.keys())
     values = tuple(grid[k] for k in keys)
-    return [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+    combinations: list[dict[str, object]] = []
+    for combo in itertools.product(*values):
+        base_params = dict(zip(keys, combo))
+        hidden_dim = int(base_params["hidden_dimension"])
+        for head_dim in HEAD_DIMS_BY_HIDDEN_DIM[hidden_dim]:
+            params = dict(base_params)
+            params["head_dim"] = head_dim
+            combinations.append(params)
+    return combinations
 
 
 def _apply_sweep_params_to_config(base_config: dict, params: dict[str, object]) -> dict:
@@ -53,6 +67,7 @@ def _apply_sweep_params_to_config(base_config: dict, params: dict[str, object]) 
         {
             "lr": params["learning_rate"],
             "d_model": params["hidden_dimension"],
+            "d_head": params["head_dim"],
             "d_state": params["ssm_dimension"],
             "n_layers": params["num_ssm_blocks"],
             "time": params["include_time"],
