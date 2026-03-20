@@ -30,6 +30,7 @@ def _run_on_gpu(
     experiment_folder: str,
     datasets: list[str],
     seeds_per_config: int | None,
+    seeds: list[int] | None,
     skip_existing: bool,
     show_progress: bool,
     progress_position: int,
@@ -65,6 +66,7 @@ def _run_on_gpu(
         experiment_folder=experiment_folder,
         datasets=datasets,
         seeds_per_config=seeds_per_config,
+        seeds=seeds,
         skip_existing=skip_existing,
         show_progress=show_progress,
         progress_desc=f"GPU {gpu_id}",
@@ -77,6 +79,7 @@ def run_two_gpu_sweep(
     experiment_folder: str,
     datasets: list[str],
     seeds_per_config: int | None,
+    seeds: list[int] | None,
     skip_existing: bool,
     gpu_ids: tuple[int, int],
     show_progress: bool,
@@ -102,6 +105,7 @@ def run_two_gpu_sweep(
                 "experiment_folder": experiment_folder,
                 "datasets": gpu0_datasets,
                 "seeds_per_config": seeds_per_config,
+                "seeds": seeds,
                 "skip_existing": skip_existing,
                 "show_progress": show_progress,
                 "progress_position": 0,
@@ -114,6 +118,7 @@ def run_two_gpu_sweep(
                 "experiment_folder": experiment_folder,
                 "datasets": gpu1_datasets,
                 "seeds_per_config": seeds_per_config,
+                "seeds": seeds,
                 "skip_existing": skip_existing,
                 "show_progress": show_progress,
                 "progress_position": 1,
@@ -155,6 +160,12 @@ if __name__ == "__main__":
         help="Optional cap on number of seeds per hyperparameter combination.",
     )
     parser.add_argument(
+        "--seeds",
+        type=str,
+        default=None,
+        help="Optional comma-separated list of seed values to use for all configs. Overrides JSON seeds and seeds_per_config.",
+    )
+    parser.add_argument(
         "--skip_existing",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -176,6 +187,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    user_seeds = None
+    if args.seeds is not None:
+        user_seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+
     try:
         mp.set_start_method("spawn")
     except RuntimeError:
@@ -185,6 +200,7 @@ if __name__ == "__main__":
         experiment_folder=args.experiment_folder,
         datasets=args.dataset_name,
         seeds_per_config=args.seeds_per_config,
+        seeds=user_seeds,
         skip_existing=args.skip_existing,
         gpu_ids=(args.gpu_ids[0], args.gpu_ids[1]),
         show_progress=args.show_progress,

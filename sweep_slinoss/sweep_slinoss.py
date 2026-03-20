@@ -130,11 +130,34 @@ def _cleanup_after_oom(path: str) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _resolve_seeds(
+    *,
+    config: dict,
+    seeds_per_config: int | None,
+    seeds: list[int] | None,
+) -> list[int]:
+    if seeds is not None:
+        return list(seeds)
+
+    available = list(config.get("seeds", []))
+    if not available:
+        raise ValueError("No seeds found in config and no --seeds override provided.")
+
+    num_seeds = config.get("num_seeds", 3)
+    available = available[: int(num_seeds)]
+
+    if seeds_per_config is not None:
+        available = available[:seeds_per_config]
+
+    return available
+
+
 def run_sweep(
     *,
     experiment_folder: str,
     datasets: list[str],
     seeds_per_config: int | None,
+    seeds: list[int] | None = None,
     skip_existing: bool,
     show_progress: bool = True,
     progress_desc: str = "Sweep",
@@ -151,10 +174,12 @@ def run_sweep(
             base_config = json.load(file)
         base_configs[dataset_name] = base_config
 
-        seeds = list(base_config["seeds"])
-        if seeds_per_config is not None:
-            seeds = seeds[:seeds_per_config]
-        total_runs += len(combinations) * len(seeds)
+        effective_seeds = _resolve_seeds(
+            config=base_config,
+            seeds_per_config=seeds_per_config,
+            seeds=seeds,
+        )
+        total_runs += len(combinations) * len(effective_seeds)
 
     progress = None
     if show_progress and tqdm is not None:
@@ -180,11 +205,13 @@ def run_sweep(
 
             run_args, run_fn = _build_run_args("SLinOSS", dataset_name, run_config)
             run_args["print_steps"] = max(int(run_args["print_steps"]), 500)
-            seeds = list(run_config["seeds"])
-            if seeds_per_config is not None:
-                seeds = seeds[:seeds_per_config]
+            effective_seeds = _resolve_seeds(
+                config=run_config,
+                seeds_per_config=seeds_per_config,
+                seeds=seeds,
+            )
 
-            for seed in seeds:
+            for seed in effective_seeds:
                 target_dir = _expected_output_path(seed, dataset_name, run_args)
                 if skip_existing and os.path.isdir(target_dir):
                     print(
