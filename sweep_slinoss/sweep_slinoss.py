@@ -179,6 +179,7 @@ def run_sweep(
             run_config = _apply_sweep_params_to_config(base_config, params)
 
             run_args, run_fn = _build_run_args("SLinOSS", dataset_name, run_config)
+            run_args["print_steps"] = max(int(run_args["print_steps"]), 500)
             seeds = list(run_config["seeds"])
             if seeds_per_config is not None:
                 seeds = seeds[:seeds_per_config]

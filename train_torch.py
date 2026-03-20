@@ -159,11 +159,13 @@ def _evaluate_accuracy(model, loader: DataLoader, device: torch.device) -> float
     model.eval()
     correct = 0
     total = 0
+    use_amp = device.type == "cuda"
     for x, lengths, labels in loader:
         x = x.to(device=device, non_blocking=True)
         lengths = lengths.to(device=device, non_blocking=True)
         labels = labels.to(device=device, non_blocking=True)
-        logits = model(x, lengths)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            logits = model(x, lengths)
         predictions = logits.argmax(dim=1)
         correct += int((predictions == labels).sum().item())
         total += int(labels.shape[0])
@@ -210,6 +212,7 @@ def train_torch_model(
     shuffle_seed: int,
     output_dir: str,
     device: torch.device,
+    mixed_precision: bool = True,
 ):
     if batch_size > len(dataset.train):
         raise ValueError("Batch size larger than training dataset size.")
@@ -217,6 +220,7 @@ def train_torch_model(
     pin_memory = device.type == "cuda"
     train_generator = torch.Generator()
     train_generator.manual_seed(shuffle_seed)
+    use_amp = mixed_precision and device.type == "cuda"
 
     train_loader = _make_loader(
         dataset.train,
@@ -224,13 +228,6 @@ def train_torch_model(
         shuffle=True,
         drop_last=True,
         generator=train_generator,
-        pin_memory=pin_memory,
-    )
-    train_eval_loader = _make_loader(
-        dataset.train,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
         pin_memory=pin_memory,
     )
     val_loader = _make_loader(
@@ -249,12 +246,14 @@ def train_torch_model(
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_scheduler(lr))
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
     train_batches = _infinite_batches(train_loader)
 
     running_loss = 0.0
-    all_train_metric = [0.0]
+    all_train_metric: list[float] = []
     all_val_metric = [0.0]
-    val_metric_for_best_model = [0.0]
+    best_val_metric = float("-inf")
+    best_state_dict: dict[str, torch.Tensor] | None = None
     best_test_metric = 0.0
     no_val_improvement = 0
     all_time = []
@@ -275,15 +274,16 @@ def train_torch_model(
             )
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x, lengths)
-        bad_logits = _first_nonfinite_index(logits)
-        if bad_logits is not None:
-            raise FloatingPointError(
-                "Encountered non-finite model logits "
-                f"at training step {step + 1}, tensor index {bad_logits}."
-            )
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            logits = model(x, lengths)
+            bad_logits = _first_nonfinite_index(logits)
+            if bad_logits is not None:
+                raise FloatingPointError(
+                    "Encountered non-finite model logits "
+                    f"at training step {step + 1}, tensor index {bad_logits}."
+                )
 
-        loss = F.cross_entropy(logits, labels)
+            loss = F.cross_entropy(logits, labels)
         loss_value = float(loss.item())
         if not math.isfinite(loss_value):
             raise FloatingPointError(
@@ -291,8 +291,13 @@ def train_torch_model(
                 f"at training step {step + 1}: loss={loss_value}."
             )
 
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        else:
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         grad_norm_value = float(grad_norm)
         if not math.isfinite(grad_norm_value):
             raise FloatingPointError(
@@ -300,38 +305,42 @@ def train_torch_model(
                 f"at training step {step + 1}: grad_norm={grad_norm_value}."
             )
 
-        optimizer.step()
+        if use_amp:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         running_loss += loss_value
 
         if (step + 1) % print_steps != 0:
             continue
 
-        train_metric = _evaluate_accuracy(model, train_eval_loader, device)
         val_metric = _evaluate_accuracy(model, val_loader, device)
         total_time = time.time() - start
         print(
             f"Step: {step + 1}, Loss: {running_loss / print_steps}, "
-            f"Train metric: {train_metric}, Validation metric: {val_metric}, "
-            f"Time: {total_time}"
+            f"Validation metric: {val_metric}, Time: {total_time}"
         )
 
+        all_train_metric.append(float("nan"))
+        all_val_metric.append(val_metric)
+        all_time.append(total_time)
+
         if step > 0:
-            if val_metric <= max(val_metric_for_best_model):
+            if val_metric <= best_val_metric:
                 no_val_improvement += 1
                 if no_val_improvement > 10:
                     break
             else:
                 no_val_improvement = 0
 
-        if val_metric >= max(val_metric_for_best_model):
-            val_metric_for_best_model.append(val_metric)
-            best_test_metric = _evaluate_accuracy(model, test_loader, device)
-            print(f"Test metric: {best_test_metric}")
+        if val_metric >= best_val_metric:
+            best_val_metric = val_metric
+            best_state_dict = {
+                key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+            }
 
         running_loss = 0.0
-        all_train_metric.append(train_metric)
-        all_val_metric.append(val_metric)
-        all_time.append(total_time)
         _save_metrics(
             output_dir,
             print_steps,
@@ -342,6 +351,9 @@ def train_torch_model(
         )
         start = time.time()
 
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+    best_test_metric = _evaluate_accuracy(model, test_loader, device)
     print(f"Test metric: {best_test_metric}")
     _save_metrics(
         output_dir,
@@ -377,6 +389,7 @@ def create_dataset_model_and_train_torch(
     id=None,
     overwrite_output_dir: bool = False,
     auto_confirm_output_dir: bool = False,
+    mixed_precision: bool = True,
     torch_compile: bool = False,
     torch_compile_mode: str = "reduce-overhead",
 ):
@@ -449,4 +462,5 @@ def create_dataset_model_and_train_torch(
         shuffle_seed=_key_to_seed(shufflekey),
         output_dir=full_output_dir,
         device=device,
+        mixed_precision=mixed_precision,
     )
