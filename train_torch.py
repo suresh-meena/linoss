@@ -22,8 +22,19 @@ def _key_to_seed(key) -> int:
     return combined % ((1 << 63) - 1)
 
 
-def _prepare_output_dir(output_dir: str) -> None:
+def _prepare_output_dir(
+    output_dir: str,
+    *,
+    overwrite: bool = False,
+    auto_confirm: bool = False,
+) -> None:
     if os.path.isdir(output_dir):
+        if overwrite or auto_confirm:
+            shutil.rmtree(output_dir)
+            os.makedirs(output_dir)
+            print(f"Directory {output_dir} has been deleted and recreated.")
+            return
+
         user_input = input(
             f"Warning: Output directory {output_dir} already exists. "
             "Do you want to delete it? (yes/no): "
@@ -280,6 +291,8 @@ def create_dataset_model_and_train_torch(
     batch_size,
     output_parent_dir="",
     id=None,
+    overwrite_output_dir: bool = False,
+    auto_confirm_output_dir: bool = False,
 ):
     del output_step, stepsize, logsig_depth, linoss_discretization, id
 
@@ -331,7 +344,11 @@ def create_dataset_model_and_train_torch(
         model_args=model_args,
     ).to(device)
 
-    _prepare_output_dir(full_output_dir)
+    _prepare_output_dir(
+        full_output_dir,
+        overwrite=overwrite_output_dir,
+        auto_confirm=auto_confirm_output_dir,
+    )
     return train_torch_model(
         dataset,
         model,

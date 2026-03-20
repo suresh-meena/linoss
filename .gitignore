@@ -1,3 +1,7 @@
 .venv/
 __pycache__/
 *.pyc
+
+#Data files
+data_dir/raw/
+data_dir/processed/
