@@ -339,6 +339,8 @@ def create_dataset_model_and_train_torch(
     id=None,
     overwrite_output_dir: bool = False,
     auto_confirm_output_dir: bool = False,
+    torch_compile: bool = False,
+    torch_compile_mode: str = "reduce-overhead",
 ):
     del output_step, stepsize, logsig_depth, linoss_discretization, id
 
@@ -389,6 +391,9 @@ def create_dataset_model_and_train_torch(
         dataset.label_dim,
         model_args=model_args,
     ).to(device)
+
+    if torch_compile:
+        model = torch.compile(model, mode=torch_compile_mode, dynamic=True)
 
     _prepare_output_dir(
         full_output_dir,

@@ -163,6 +163,9 @@ def _build_run_args(
         "output_parent_dir": config["output_parent_dir"],
         "id": config.get("id"),
     }
+    if model_name in TORCH_MODELS:
+        run_args["torch_compile"] = _parse_bool(config.get("torch_compile", False))
+        run_args["torch_compile_mode"] = config.get("torch_compile_mode", "reduce-overhead")
     return run_args, run_fn
 
 
