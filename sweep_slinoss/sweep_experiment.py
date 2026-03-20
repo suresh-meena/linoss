@@ -34,6 +34,7 @@ def _run_on_gpu(
     skip_existing: bool,
     show_progress: bool,
     progress_position: int,
+    tqdm_lock=None,
 ) -> None:
     # Isolate each worker to a single physical GPU so CUDA extensions that
     # default to local device 0 cannot accidentally collide on GPU 0.
@@ -73,6 +74,7 @@ def _run_on_gpu(
         show_progress=show_progress,
         progress_desc=f"GPU {gpu_id}",
         progress_position=progress_position,
+        tqdm_lock=tqdm_lock,
     )
 
 
@@ -100,6 +102,8 @@ def run_two_gpu_sweep(
         print(f"GPU {gpu_ids[0]} datasets: {gpu0_datasets}")
         print(f"GPU {gpu_ids[1]} datasets: {gpu1_datasets}")
 
+    tqdm_lock = mp.RLock()
+
     workers = [
         mp.Process(
             target=_run_on_gpu,
@@ -112,6 +116,7 @@ def run_two_gpu_sweep(
                 "skip_existing": skip_existing,
                 "show_progress": show_progress,
                 "progress_position": 0,
+                "tqdm_lock": tqdm_lock,
             },
         ),
         mp.Process(
@@ -125,6 +130,7 @@ def run_two_gpu_sweep(
                 "skip_existing": skip_existing,
                 "show_progress": show_progress,
                 "progress_position": 1,
+                "tqdm_lock": tqdm_lock,
             },
         ),
     ]

@@ -162,6 +162,7 @@ def run_sweep(
     show_progress: bool = True,
     progress_desc: str = "Sweep",
     progress_position: int = 0,
+    tqdm_lock=None,
 ) -> None:
     combinations = _iter_grid(HYPERPARAM_GRID)
 
@@ -181,6 +182,9 @@ def run_sweep(
             seeds=seeds,
         )
         total_runs += len(combinations) * len(effective_seeds)
+
+    if tqdm_lock is not None and tqdm is not None:
+        tqdm.set_lock(tqdm_lock)
 
     progress = None
     if show_progress and tqdm is not None:
