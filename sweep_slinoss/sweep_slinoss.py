@@ -34,8 +34,8 @@ HYPERPARAM_GRID = {
 
 HEAD_DIMS_BY_HIDDEN_DIM = {
     16: [16],
-    64: [16, 32],
-    128: [16, 32, 64],
+    64: [32],
+    128: [64],
 }
 
 DEFAULT_DATASETS = [
