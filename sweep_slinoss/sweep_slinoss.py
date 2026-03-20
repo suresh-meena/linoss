@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import itertools
 import json
 import os
+import shutil
 import sys
 
 # Ensure repository root is on sys.path when running from sweep_slinoss folder directly.
@@ -80,6 +82,30 @@ def _expected_output_path(seed: int, dataset_name: str, run_args: dict) -> str:
     return os.path.join(output_parent_dir, output_dir)
 
 
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "cuda out of memory" in message
+        or "outofmemoryerror" in message
+        or "out of memory" in message and "cuda" in message
+    )
+
+
+def _cleanup_after_oom(path: str) -> None:
+    try:
+        import torch
+    except Exception:
+        torch = None
+
+    gc.collect()
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def run_sweep(
     *,
     experiment_folder: str,
@@ -118,6 +144,7 @@ def run_sweep(
 
     skipped_runs = 0
     completed_runs = 0
+    oom_failed_runs = 0
 
     for dataset_name in datasets:
         base_config = base_configs[dataset_name]
@@ -148,13 +175,28 @@ def run_sweep(
                     f"(combo {combo_idx}/{len(combinations)}), "
                     f"dataset={dataset_name}, seed={seed}, params={params}"
                 )
-                run_fn(
-                    seed=seed,
-                    overwrite_output_dir=False,
-                    auto_confirm_output_dir=False,
-                    **run_args,
-                )
-                completed_runs += 1
+                try:
+                    run_fn(
+                        seed=seed,
+                        overwrite_output_dir=False,
+                        auto_confirm_output_dir=False,
+                        **run_args,
+                    )
+                    completed_runs += 1
+                except Exception as exc:
+                    if _is_cuda_oom_error(exc):
+                        oom_failed_runs += 1
+                        print(
+                            "Skipping run after CUDA OOM "
+                            f"(combo {combo_idx}/{len(combinations)}), "
+                            f"dataset={dataset_name}, seed={seed}, params={params}"
+                        )
+                        print(f"OOM details: {exc}")
+                        _cleanup_after_oom(target_dir)
+                        if progress is not None:
+                            progress.update(1)
+                        continue
+                    raise
                 if progress is not None:
                     progress.update(1)
 
@@ -163,6 +205,7 @@ def run_sweep(
 
     print(
         f"{progress_desc} summary: completed={completed_runs}, skipped={skipped_runs}, "
+        f"oom_failed={oom_failed_runs}, "
         f"total={total_runs}"
     )
 

@@ -34,6 +34,11 @@ def _run_on_gpu(
     show_progress: bool,
     progress_position: int,
 ) -> None:
+    # Isolate each worker to a single physical GPU so CUDA extensions that
+    # default to local device 0 cannot accidentally collide on GPU 0.
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
     import torch
 
     if not datasets:
@@ -42,16 +47,18 @@ def _run_on_gpu(
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available, but GPU execution was requested.")
-    if gpu_id >= torch.cuda.device_count():
+    visible_count = torch.cuda.device_count()
+    if visible_count < 1:
         raise RuntimeError(
-            f"Requested GPU {gpu_id}, but only {torch.cuda.device_count()} GPU(s) detected."
+            f"Requested GPU {gpu_id}, but no visible CUDA devices were detected in worker."
         )
 
-    torch.cuda.set_device(gpu_id)
+    torch.cuda.set_device(0)
     active_device = torch.cuda.current_device()
     device_name = torch.cuda.get_device_name(active_device)
     print(
-        f"[GPU {gpu_id}] Using CUDA device cuda:{active_device} ({device_name})."
+        f"[GPU {gpu_id}] Using CUDA device cuda:{active_device} ({device_name}), "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
     )
     print(f"[GPU {gpu_id}] Running datasets: {datasets}")
     run_sweep(
