@@ -182,7 +182,7 @@ def run_two_gpu_sweep(
                     total_tasks += msg["value"]
                     totals_received += 1
                 elif msg["type"] == "update":
-                    pending_updates += 1
+                    pending_updates += float(msg.get("value", 1.0))
                 elif msg["type"] == "done":
                     completed_workers += 1
 
@@ -199,7 +199,7 @@ def run_two_gpu_sweep(
                         pbar.total = total_tasks
                         pbar.refresh()
                     elif msg["type"] == "update":
-                        pbar.update(1)
+                        pbar.update(float(msg.get("value", 1.0)))
                     elif msg["type"] == "done":
                         completed_workers += 1
 
@@ -212,7 +212,7 @@ def run_two_gpu_sweep(
                         pbar.total = total_tasks
                         pbar.refresh()
                     elif msg["type"] == "update":
-                        pbar.update(1)
+                        pbar.update(float(msg.get("value", 1.0)))
         else:
             # tqdm is missing but show_progress was true, just wait
             pass

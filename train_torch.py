@@ -7,6 +7,7 @@ import shutil
 import time
 import hashlib
 import math
+from typing import Callable
 
 import jax.random as jr
 import numpy as np
@@ -235,6 +236,7 @@ def train_torch_model(
     device: torch.device,
     mixed_precision: bool = False,
     verbose: bool = True,
+    progress_callback: Callable[[int, int], None] | None = None,
 ):
     if batch_size > len(dataset.train):
         raise ValueError("Batch size larger than training dataset size.")
@@ -351,6 +353,8 @@ def train_torch_model(
         all_train_metric.append(float("nan"))
         all_val_metric.append(val_metric)
         all_time.append(total_time)
+        if progress_callback is not None:
+            progress_callback(step + 1, num_steps)
 
         if step > 0:
             if val_metric <= best_val_metric:
@@ -420,6 +424,7 @@ def create_dataset_model_and_train_torch(
     torch_compile: bool = False,
     torch_compile_mode: str = "reduce-overhead",
     verbose: bool = True,
+    progress_callback: Callable[[int, int], None] | None = None,
 ):
     del output_step, stepsize, logsig_depth, linoss_discretization, id
 
@@ -495,4 +500,5 @@ def create_dataset_model_and_train_torch(
         device=device,
         mixed_precision=mixed_precision,
         verbose=verbose,
+        progress_callback=progress_callback,
     )

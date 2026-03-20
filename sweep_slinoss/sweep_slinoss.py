@@ -165,6 +165,12 @@ def run_sweep(
     tqdm_lock=None,
     progress_queue=None,
 ) -> None:
+    def emit_progress(value: float = 1.0) -> None:
+        if progress is not None:
+            progress.update(value)
+        if progress_queue is not None:
+            progress_queue.put({"type": "update", "value": value})
+
     combinations = _iter_grid(HYPERPARAM_GRID)
 
     if not show_progress and progress_queue is None:
@@ -220,13 +226,23 @@ def run_sweep(
             )
 
             for seed in effective_seeds:
+                reported_run_progress = 0.0
+
+                def report_run_progress(completed_steps: int, total_steps: int) -> None:
+                    nonlocal reported_run_progress
+                    if total_steps <= 0:
+                        return
+                    run_progress = min(max(completed_steps / total_steps, 0.0), 1.0)
+                    delta = run_progress - reported_run_progress
+                    if delta <= 0:
+                        return
+                    reported_run_progress = run_progress
+                    emit_progress(delta)
+
                 target_dir = _expected_output_path(seed, dataset_name, run_args)
                 if skip_existing and os.path.isdir(target_dir):
                     skipped_runs += 1
-                    if progress is not None:
-                        progress.update(1)
-                    if progress_queue is not None:
-                        progress_queue.put({"type": "update"})
+                    emit_progress(1.0)
                     continue
                 try:
                     run_fn(
@@ -234,6 +250,7 @@ def run_sweep(
                         overwrite_output_dir=False,
                         auto_confirm_output_dir=False,
                         verbose=not (show_progress or progress_queue is not None),
+                        progress_callback=report_run_progress,
                         **run_args,
                     )
                     completed_runs += 1
@@ -243,26 +260,17 @@ def run_sweep(
                         if not show_progress and progress_queue is None:
                             print(f"Skipping run after CUDA OOM (dataset={dataset_name}, seed={seed})")
                         _cleanup_after_oom(target_dir)
-                        if progress is not None:
-                            progress.update(1)
-                        if progress_queue is not None:
-                            progress_queue.put({"type": "update"})
+                        emit_progress(1.0 - reported_run_progress)
                         continue
                     if _is_nonfinite_training_error(exc):
                         nonfinite_failed_runs += 1
                         if not show_progress and progress_queue is None:
                             print(f"Skipping run after non-finite values (dataset={dataset_name}, seed={seed})")
                         _cleanup_after_oom(target_dir)
-                        if progress is not None:
-                            progress.update(1)
-                        if progress_queue is not None:
-                            progress_queue.put({"type": "update"})
+                        emit_progress(1.0 - reported_run_progress)
                         continue
                     raise
-                if progress is not None:
-                    progress.update(1)
-                if progress_queue is not None:
-                    progress_queue.put({"type": "update"})
+                emit_progress(1.0 - reported_run_progress)
 
     if progress is not None:
         progress.close()
