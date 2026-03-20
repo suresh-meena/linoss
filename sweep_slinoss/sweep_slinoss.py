@@ -91,6 +91,15 @@ def _is_cuda_oom_error(exc: BaseException) -> bool:
     )
 
 
+def _is_nonfinite_training_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "non-finite" in message
+        or "nan" in message
+        or "inf" in message and "loss" in message
+    )
+
+
 def _cleanup_after_oom(path: str) -> None:
     try:
         import torch
@@ -145,6 +154,7 @@ def run_sweep(
     skipped_runs = 0
     completed_runs = 0
     oom_failed_runs = 0
+    nonfinite_failed_runs = 0
 
     for dataset_name in datasets:
         base_config = base_configs[dataset_name]
@@ -196,6 +206,18 @@ def run_sweep(
                         if progress is not None:
                             progress.update(1)
                         continue
+                    if _is_nonfinite_training_error(exc):
+                        nonfinite_failed_runs += 1
+                        print(
+                            "Skipping run after non-finite training values "
+                            f"(combo {combo_idx}/{len(combinations)}), "
+                            f"dataset={dataset_name}, seed={seed}, params={params}"
+                        )
+                        print(f"Non-finite details: {exc}")
+                        _cleanup_after_oom(target_dir)
+                        if progress is not None:
+                            progress.update(1)
+                        continue
                     raise
                 if progress is not None:
                     progress.update(1)
@@ -206,6 +228,7 @@ def run_sweep(
     print(
         f"{progress_desc} summary: completed={completed_runs}, skipped={skipped_runs}, "
         f"oom_failed={oom_failed_runs}, "
+        f"nonfinite_failed={nonfinite_failed_runs}, "
         f"total={total_runs}"
     )
 

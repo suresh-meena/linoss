@@ -6,6 +6,7 @@ import os
 import shutil
 import time
 import hashlib
+import math
 
 import jax.random as jr
 import numpy as np
@@ -145,6 +146,14 @@ def _infinite_batches(loader: DataLoader):
             yield batch
 
 
+def _first_nonfinite_index(tensor: torch.Tensor) -> tuple[int, ...] | None:
+    finite_mask = torch.isfinite(tensor)
+    if bool(finite_mask.all()):
+        return None
+    bad = (~finite_mask).nonzero(as_tuple=False)
+    return tuple(int(i) for i in bad[0].tolist())
+
+
 @torch.no_grad()
 def _evaluate_accuracy(model, loader: DataLoader, device: torch.device) -> float:
     model.eval()
@@ -258,12 +267,41 @@ def train_torch_model(
         lengths = lengths.to(device=device, non_blocking=True)
         labels = labels.to(device=device, non_blocking=True)
 
+        bad_input = _first_nonfinite_index(x)
+        if bad_input is not None:
+            raise FloatingPointError(
+                "Encountered non-finite input batch values "
+                f"at training step {step + 1}, tensor index {bad_input}."
+            )
+
         optimizer.zero_grad(set_to_none=True)
         logits = model(x, lengths)
+        bad_logits = _first_nonfinite_index(logits)
+        if bad_logits is not None:
+            raise FloatingPointError(
+                "Encountered non-finite model logits "
+                f"at training step {step + 1}, tensor index {bad_logits}."
+            )
+
         loss = F.cross_entropy(logits, labels)
+        loss_value = float(loss.item())
+        if not math.isfinite(loss_value):
+            raise FloatingPointError(
+                "Encountered non-finite loss "
+                f"at training step {step + 1}: loss={loss_value}."
+            )
+
         loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm_value = float(grad_norm)
+        if not math.isfinite(grad_norm_value):
+            raise FloatingPointError(
+                "Encountered non-finite gradient norm "
+                f"at training step {step + 1}: grad_norm={grad_norm_value}."
+            )
+
         optimizer.step()
-        running_loss += float(loss.item())
+        running_loss += loss_value
 
         if (step + 1) % print_steps != 0:
             continue
