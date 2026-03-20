@@ -1,0 +1,206 @@
+"""Hyperparameter sweep runner for SLinOSS experiments only."""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import os
+
+from run_experiment import _build_run_args
+from train_torch import _build_output_dir
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+
+HYPERPARAM_GRID = {
+    "learning_rate": [1e-3, 1e-4, 1e-5],
+    "hidden_dimension": [16, 64, 128, 256],
+    "ssm_dimension": [16, 64, 128, 256],
+    "num_ssm_blocks": [1, 2, 4, 6],
+    "include_time": [True, False],
+}
+
+DEFAULT_DATASETS = [
+    "EigenWorms",
+    "EthanolConcentration",
+    "Heartbeat",
+    "MotorImagery",
+    "SelfRegulationSCP1",
+    "SelfRegulationSCP2",
+]
+
+def _iter_grid(grid: dict[str, list]) -> list[dict[str, object]]:
+    keys = tuple(grid.keys())
+    values = tuple(grid[k] for k in keys)
+    return [dict(zip(keys, combo)) for combo in itertools.product(*values)]
+
+
+def _apply_sweep_params_to_config(base_config: dict, params: dict[str, object]) -> dict:
+    run_config = dict(base_config)
+    run_config.update(
+        {
+            "lr": params["learning_rate"],
+            "d_model": params["hidden_dimension"],
+            "d_state": params["ssm_dimension"],
+            "n_layers": params["num_ssm_blocks"],
+            "time": params["include_time"],
+        }
+    )
+    return run_config
+
+
+def _expected_output_path(seed: int, dataset_name: str, run_args: dict) -> str:
+    output_parent_dir = os.path.join(
+        run_args["output_parent_dir"],
+        "outputs",
+        "SLinOSS",
+        dataset_name,
+    )
+    output_dir = _build_output_dir(
+        seed=seed,
+        T=run_args["T"],
+        include_time=run_args["include_time"],
+        num_steps=run_args["num_steps"],
+        lr=run_args["lr"],
+        model_name="SLinOSS",
+        stepsize=run_args["stepsize"],
+        logsig_depth=run_args["logsig_depth"],
+        model_args=run_args["model_args"],
+    )
+    return os.path.join(output_parent_dir, output_dir)
+
+
+def run_sweep(
+    *,
+    experiment_folder: str,
+    datasets: list[str],
+    seeds_per_config: int | None,
+    skip_existing: bool,
+    show_progress: bool = True,
+    progress_desc: str = "Sweep",
+    progress_position: int = 0,
+) -> None:
+    combinations = _iter_grid(HYPERPARAM_GRID)
+    print(f"Total hyperparameter combinations: {len(combinations)}")
+
+    base_configs: dict[str, dict] = {}
+    total_runs = 0
+    for dataset_name in datasets:
+        config_path = os.path.join(experiment_folder, "SLinOSS", f"{dataset_name}.json")
+        with open(config_path, "r", encoding="utf-8") as file:
+            base_config = json.load(file)
+        base_configs[dataset_name] = base_config
+
+        seeds = list(base_config["seeds"])
+        if seeds_per_config is not None:
+            seeds = seeds[:seeds_per_config]
+        total_runs += len(combinations) * len(seeds)
+
+    progress = None
+    if show_progress and tqdm is not None:
+        progress = tqdm(
+            total=total_runs,
+            desc=progress_desc,
+            position=progress_position,
+            dynamic_ncols=True,
+            leave=True,
+        )
+
+    skipped_runs = 0
+    completed_runs = 0
+
+    for dataset_name in datasets:
+        base_config = base_configs[dataset_name]
+
+        print(f"\nDataset: {dataset_name}")
+        for combo_idx, params in enumerate(combinations, start=1):
+            run_config = _apply_sweep_params_to_config(base_config, params)
+
+            run_args, run_fn = _build_run_args("SLinOSS", dataset_name, run_config)
+            seeds = list(run_config["seeds"])
+            if seeds_per_config is not None:
+                seeds = seeds[:seeds_per_config]
+
+            for seed in seeds:
+                target_dir = _expected_output_path(seed, dataset_name, run_args)
+                if skip_existing and os.path.isdir(target_dir):
+                    print(
+                        "Skipping existing run "
+                        f"(combo {combo_idx}/{len(combinations)}): {target_dir}"
+                    )
+                    skipped_runs += 1
+                    if progress is not None:
+                        progress.update(1)
+                    continue
+
+                print(
+                    "Starting run "
+                    f"(combo {combo_idx}/{len(combinations)}), "
+                    f"dataset={dataset_name}, seed={seed}, params={params}"
+                )
+                run_fn(
+                    seed=seed,
+                    overwrite_output_dir=False,
+                    auto_confirm_output_dir=False,
+                    **run_args,
+                )
+                completed_runs += 1
+                if progress is not None:
+                    progress.update(1)
+
+    if progress is not None:
+        progress.close()
+
+    print(
+        f"{progress_desc} summary: completed={completed_runs}, skipped={skipped_runs}, "
+        f"total={total_runs}"
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run an SLinOSS-only hyperparameter sweep over a fixed grid.",
+    )
+    parser.add_argument(
+        "--experiment_folder",
+        type=str,
+        default="experiment_configs/repeats",
+        help="Directory that contains the SLinOSS dataset config JSON files.",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        nargs="+",
+        default=DEFAULT_DATASETS,
+        help="One or more dataset names to sweep.",
+    )
+    parser.add_argument(
+        "--seeds_per_config",
+        type=int,
+        default=None,
+        help="Optional cap on number of seeds per hyperparameter combination.",
+    )
+    parser.add_argument(
+        "--skip_existing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip runs whose output directory already exists.",
+    )
+    parser.add_argument(
+        "--show_progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show a tqdm progress bar when tqdm is installed.",
+    )
+    args = parser.parse_args()
+
+    run_sweep(
+        experiment_folder=args.experiment_folder,
+        datasets=args.dataset_name,
+        seeds_per_config=args.seeds_per_config,
+        skip_existing=args.skip_existing,
+        show_progress=args.show_progress,
+    )
