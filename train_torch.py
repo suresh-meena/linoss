@@ -128,15 +128,32 @@ def _make_loader(
     drop_last: bool,
     generator: torch.Generator | None = None,
     pin_memory: bool,
+    num_workers: int | None = None,
 ) -> DataLoader:
-    return DataLoader(
-        dataset,
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 1
+        worker_count = int(
+            os.environ.get("LINOSS_DATALOADER_WORKERS", min(4, max(1, cpu_count // 2)))
+        )
+    else:
+        worker_count = int(num_workers)
+    if worker_count <= 0:
+        worker_count = 0
+
+    loader_kwargs = dict(
+        dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         drop_last=drop_last,
         generator=generator,
-        num_workers=0,
+        num_workers=worker_count,
         pin_memory=pin_memory,
+    )
+    if worker_count > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+    return DataLoader(
+        **loader_kwargs,
     )
 
 
@@ -229,6 +246,7 @@ def train_torch_model(
         drop_last=True,
         generator=train_generator,
         pin_memory=pin_memory,
+        num_workers=None,
     )
     val_loader = _make_loader(
         dataset.val,
@@ -236,6 +254,7 @@ def train_torch_model(
         shuffle=False,
         drop_last=False,
         pin_memory=pin_memory,
+        num_workers=0,
     )
     test_loader = _make_loader(
         dataset.test,
@@ -243,6 +262,7 @@ def train_torch_model(
         shuffle=False,
         drop_last=False,
         pin_memory=pin_memory,
+        num_workers=0,
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_scheduler(lr))
