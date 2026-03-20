@@ -8,6 +8,7 @@ data_dir/processed/
 
 #results
 outputs/SLinOSS/
+outputs/smoke_timing/
 
 #Smoke
 sweep_slinoss/smoke_timing.py
