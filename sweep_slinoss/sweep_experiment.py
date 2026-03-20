@@ -35,6 +35,7 @@ def _run_on_gpu(
     show_progress: bool,
     progress_position: int,
     tqdm_lock=None,
+    progress_queue=None,
 ) -> None:
     # Isolate each worker to a single physical GPU so CUDA extensions that
     # default to local device 0 cannot accidentally collide on GPU 0.
@@ -44,7 +45,7 @@ def _run_on_gpu(
     import torch
 
     if not datasets:
-        if not show_progress:
+        if not show_progress and progress_queue is None:
             print(f"[GPU {gpu_id}] No datasets assigned. Worker exiting.")
         return
 
@@ -59,7 +60,7 @@ def _run_on_gpu(
     torch.cuda.set_device(0)
     active_device = torch.cuda.current_device()
     device_name = torch.cuda.get_device_name(active_device)
-    if not show_progress:
+    if not show_progress and progress_queue is None:
         print(
             f"[GPU {gpu_id}] Using CUDA device cuda:{active_device} ({device_name}), "
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
@@ -75,6 +76,7 @@ def _run_on_gpu(
         progress_desc=f"GPU {gpu_id}",
         progress_position=progress_position,
         tqdm_lock=tqdm_lock,
+        progress_queue=progress_queue,
     )
 
 
@@ -103,6 +105,7 @@ def run_two_gpu_sweep(
         print(f"GPU {gpu_ids[1]} datasets: {gpu1_datasets}")
 
     tqdm_lock = mp.RLock()
+    progress_queue = mp.Queue() if show_progress else None
 
     workers = [
         mp.Process(
@@ -117,6 +120,7 @@ def run_two_gpu_sweep(
                 "show_progress": show_progress,
                 "progress_position": 0,
                 "tqdm_lock": tqdm_lock,
+                "progress_queue": progress_queue,
             },
         ),
         mp.Process(
@@ -131,12 +135,51 @@ def run_two_gpu_sweep(
                 "show_progress": show_progress,
                 "progress_position": 1,
                 "tqdm_lock": tqdm_lock,
+                "progress_queue": progress_queue,
             },
         ),
     ]
 
     for worker in workers:
         worker.start()
+
+    if show_progress and progress_queue is not None:
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            tqdm = None
+
+        if tqdm is not None:
+            total_tasks = 0
+            expected_totals = sum(1 for d in (gpu0_datasets, gpu1_datasets) if d)
+            totals_received = 0
+            
+            while totals_received < expected_totals:
+                msg = progress_queue.get()
+                if msg["type"] == "total":
+                    total_tasks += msg["value"]
+                    totals_received += 1
+            
+            with tqdm(total=total_tasks, desc="Overall Sweep Progress", dynamic_ncols=True) as pbar:
+                active_workers = len(workers)
+                while active_workers > 0:
+                    active_workers = sum(1 for w in workers if w.is_alive())
+                    
+                    while not progress_queue.empty():
+                        msg = progress_queue.get()
+                        if msg["type"] == "update":
+                            pbar.update(1)
+                    
+                    import time
+                    time.sleep(0.1)
+                
+                while not progress_queue.empty():
+                    msg = progress_queue.get()
+                    if msg["type"] == "update":
+                        pbar.update(1)
+        else:
+            # tqdm is missing but show_progress was true, just wait
+            pass
 
     for worker in workers:
         worker.join()

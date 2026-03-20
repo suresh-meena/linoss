@@ -163,10 +163,11 @@ def run_sweep(
     progress_desc: str = "Sweep",
     progress_position: int = 0,
     tqdm_lock=None,
+    progress_queue=None,
 ) -> None:
     combinations = _iter_grid(HYPERPARAM_GRID)
 
-    if not show_progress:
+    if not show_progress and progress_queue is None:
         print(f"Total hyperparameter combinations: {len(combinations)}")
 
     base_configs: dict[str, dict] = {}
@@ -187,7 +188,10 @@ def run_sweep(
         tqdm.set_lock(tqdm_lock)
 
     progress = None
-    if show_progress and tqdm is not None:
+    if progress_queue is not None:
+        show_progress = False
+        progress_queue.put({"type": "total", "value": total_runs, "worker": progress_desc})
+    elif show_progress and tqdm is not None:
         progress = tqdm(
             total=total_runs,
             desc=progress_desc,
@@ -221,41 +225,49 @@ def run_sweep(
                     skipped_runs += 1
                     if progress is not None:
                         progress.update(1)
+                    if progress_queue is not None:
+                        progress_queue.put({"type": "update"})
                     continue
                 try:
                     run_fn(
                         seed=seed,
                         overwrite_output_dir=False,
                         auto_confirm_output_dir=False,
-                        verbose=not show_progress,
+                        verbose=not (show_progress or progress_queue is not None),
                         **run_args,
                     )
                     completed_runs += 1
                 except Exception as exc:
                     if _is_cuda_oom_error(exc):
                         oom_failed_runs += 1
-                        if not show_progress:
+                        if not show_progress and progress_queue is None:
                             print(f"Skipping run after CUDA OOM (dataset={dataset_name}, seed={seed})")
                         _cleanup_after_oom(target_dir)
                         if progress is not None:
                             progress.update(1)
+                        if progress_queue is not None:
+                            progress_queue.put({"type": "update"})
                         continue
                     if _is_nonfinite_training_error(exc):
                         nonfinite_failed_runs += 1
-                        if not show_progress:
+                        if not show_progress and progress_queue is None:
                             print(f"Skipping run after non-finite values (dataset={dataset_name}, seed={seed})")
                         _cleanup_after_oom(target_dir)
                         if progress is not None:
                             progress.update(1)
+                        if progress_queue is not None:
+                            progress_queue.put({"type": "update"})
                         continue
                     raise
                 if progress is not None:
                     progress.update(1)
+                if progress_queue is not None:
+                    progress_queue.put({"type": "update"})
 
     if progress is not None:
         progress.close()
 
-    if not show_progress:
+    if not show_progress and progress_queue is None:
         print(
             f"{progress_desc} summary: completed={completed_runs}, skipped={skipped_runs}, "
             f"oom_failed={oom_failed_runs}, "
