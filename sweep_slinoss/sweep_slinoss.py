@@ -28,7 +28,7 @@ except ImportError:
 HYPERPARAM_GRID = {
     "learning_rate": [1e-3, 1e-4, 1e-5],
     "hidden_dimension": [16, 64, 128],
-    "ssm_dimension": [16, 64, 256],
+    "ssm_dimension": [16, 64],  #remmoved 256 
     "num_ssm_blocks": [2, 4, 6],
     "include_time": [True, False],
 }
