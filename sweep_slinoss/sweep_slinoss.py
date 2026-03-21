@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import sys
+import traceback
 
 # Ensure repository root is on sys.path when running from sweep_slinoss folder directly.
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -48,6 +49,7 @@ DEFAULT_DATASETS = [
 ]
 
 COMPLETION_MARKER = "_sweep_complete.json"
+FAILURE_MARKER = "_sweep_failed.json"
 REQUIRED_OUTPUT_FILES = (
     "steps.npy",
     "all_train_metric.npy",
@@ -110,6 +112,10 @@ def _completion_marker_path(output_dir: str) -> str:
     return os.path.join(output_dir, COMPLETION_MARKER)
 
 
+def _failure_marker_path(output_dir: str) -> str:
+    return os.path.join(output_dir, FAILURE_MARKER)
+
+
 def _has_required_output_files(output_dir: str) -> bool:
     return all(os.path.isfile(os.path.join(output_dir, filename)) for filename in REQUIRED_OUTPUT_FILES)
 
@@ -149,6 +155,24 @@ def _write_completion_marker(
         json.dump(marker, file, indent=2, sort_keys=True)
 
 
+def _sanitize_filename_component(value: str) -> str:
+    cleaned = []
+    for ch in value.lower():
+        if ch.isalnum():
+            cleaned.append(ch)
+        elif ch in {" ", "-", "_"}:
+            cleaned.append("_")
+    slug = "".join(cleaned).strip("_")
+    return slug or "default"
+
+
+def _safe_error_message(exc: BaseException, *, limit: int = 2000) -> str:
+    message = str(exc).strip() or exc.__class__.__name__
+    if len(message) <= limit:
+        return message
+    return f"{message[:limit]}..."
+
+
 def _is_cuda_oom_error(exc: BaseException) -> bool:
     message = str(exc).lower()
     return (
@@ -167,7 +191,24 @@ def _is_nonfinite_training_error(exc: BaseException) -> bool:
     )
 
 
-def _cleanup_after_oom(path: str) -> None:
+def _classify_failure(exc: BaseException) -> str:
+    message = str(exc).lower()
+    if _is_cuda_oom_error(exc):
+        return "cuda_oom"
+    if _is_nonfinite_training_error(exc):
+        return "nonfinite"
+    if "cuda_error_invalid_value" in message or "invalid value" in message and "cuda" in message:
+        return "cuda_invalid_value"
+    if "illegal memory access" in message and "cuda" in message:
+        return "cuda_illegal_memory_access"
+    if "cuda" in message:
+        return "cuda_runtime_error"
+    if "cutlass" in message:
+        return "cutlass_error"
+    return exc.__class__.__name__.lower()
+
+
+def _cleanup_after_failure(path: str) -> None:
     try:
         import torch
     except Exception:
@@ -180,6 +221,51 @@ def _cleanup_after_oom(path: str) -> None:
 
     if os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
+
+
+def _write_failure_marker(
+    output_dir: str,
+    *,
+    dataset_name: str,
+    seed: int,
+    run_args: dict,
+    failure_kind: str,
+    exc: BaseException,
+) -> None:
+    os.makedirs(output_dir, exist_ok=True)
+    marker_path = _failure_marker_path(output_dir)
+    marker = {
+        "status": "failed",
+        "dataset_name": dataset_name,
+        "seed": seed,
+        "failure_kind": failure_kind,
+        "error_type": exc.__class__.__name__,
+        "error_message": _safe_error_message(exc),
+        "num_steps": int(run_args["num_steps"]),
+        "print_steps": int(run_args["print_steps"]),
+        "model_args": run_args.get("model_args", {}),
+        "traceback": traceback.format_exc(limit=25),
+    }
+    with open(marker_path, "w", encoding="utf-8") as file:
+        json.dump(marker, file, indent=2, sort_keys=True)
+
+
+def _append_failure_log(failure_log_path: str | None, record: dict[str, object]) -> None:
+    if failure_log_path is None:
+        return
+    parent = os.path.dirname(failure_log_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(failure_log_path, "a", encoding="utf-8") as file:
+        file.write(json.dumps(record, sort_keys=True))
+        file.write("\n")
+
+
+def _default_failure_log_path(base_configs: dict[str, dict], progress_desc: str) -> str:
+    first_config = next(iter(base_configs.values()))
+    output_parent_dir = str(first_config.get("output_parent_dir", ""))
+    filename = f"_sweep_failures_{_sanitize_filename_component(progress_desc)}.jsonl"
+    return os.path.join(output_parent_dir, "outputs", "SLinOSS", filename)
 
 
 def _resolve_seeds(
@@ -216,6 +302,7 @@ def run_sweep(
     progress_position: int = 0,
     tqdm_lock=None,
     progress_queue=None,
+    failure_log_path: str | None = None,
 ) -> None:
     def emit_progress(value: float = 1.0) -> None:
         if progress is not None:
@@ -242,6 +329,9 @@ def run_sweep(
         )
         total_runs += len(combinations) * len(effective_seeds)
 
+    if failure_log_path is None:
+        failure_log_path = _default_failure_log_path(base_configs, progress_desc)
+
     if tqdm_lock is not None and tqdm is not None:
         tqdm.set_lock(tqdm_lock)
 
@@ -260,8 +350,7 @@ def run_sweep(
 
     skipped_runs = 0
     completed_runs = 0
-    oom_failed_runs = 0
-    nonfinite_failed_runs = 0
+    failed_runs: dict[str, int] = {}
 
     for dataset_name in datasets:
         base_config = base_configs[dataset_name]
@@ -318,32 +407,52 @@ def run_sweep(
                     )
                     completed_runs += 1
                 except Exception as exc:
-                    if _is_cuda_oom_error(exc):
-                        oom_failed_runs += 1
-                        if not show_progress and progress_queue is None:
-                            print(f"Skipping run after CUDA OOM (dataset={dataset_name}, seed={seed})")
-                        _cleanup_after_oom(target_dir)
-                        emit_progress(1.0 - reported_run_progress)
-                        continue
-                    if _is_nonfinite_training_error(exc):
-                        nonfinite_failed_runs += 1
-                        if not show_progress and progress_queue is None:
-                            print(f"Skipping run after non-finite values (dataset={dataset_name}, seed={seed})")
-                        _cleanup_after_oom(target_dir)
-                        emit_progress(1.0 - reported_run_progress)
-                        continue
-                    raise
+                    failure_kind = _classify_failure(exc)
+                    failed_runs[failure_kind] = failed_runs.get(failure_kind, 0) + 1
+                    _cleanup_after_failure(target_dir)
+                    _write_failure_marker(
+                        target_dir,
+                        dataset_name=dataset_name,
+                        seed=seed,
+                        run_args=run_args,
+                        failure_kind=failure_kind,
+                        exc=exc,
+                    )
+                    _append_failure_log(
+                        failure_log_path,
+                        {
+                            "dataset_name": dataset_name,
+                            "seed": seed,
+                            "combo_index": combo_idx,
+                            "params": params,
+                            "failure_kind": failure_kind,
+                            "error_type": exc.__class__.__name__,
+                            "error_message": _safe_error_message(exc),
+                            "target_dir": target_dir,
+                        },
+                    )
+                    if not show_progress and progress_queue is None:
+                        print(
+                            "Skipping failed run "
+                            f"(dataset={dataset_name}, seed={seed}, combo={combo_idx}, "
+                            f"failure_kind={failure_kind}): {_safe_error_message(exc, limit=300)}"
+                        )
+                    emit_progress(1.0 - reported_run_progress)
+                    continue
                 emit_progress(1.0 - reported_run_progress)
 
     if progress is not None:
         progress.close()
 
     if not show_progress and progress_queue is None:
+        total_failed_runs = sum(failed_runs.values())
+        failure_summary = ", ".join(
+            f"{name}={count}" for name, count in sorted(failed_runs.items())
+        ) or "none"
         print(
             f"{progress_desc} summary: completed={completed_runs}, skipped={skipped_runs}, "
-            f"oom_failed={oom_failed_runs}, "
-            f"nonfinite_failed={nonfinite_failed_runs}, "
-            f"total_runs={completed_runs + skipped_runs + oom_failed_runs + nonfinite_failed_runs}"
+            f"failed={total_failed_runs}, failure_breakdown={failure_summary}, "
+            f"total_runs={completed_runs + skipped_runs + total_failed_runs}"
         )
 
 
