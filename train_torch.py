@@ -138,7 +138,7 @@ def _make_loader(
     if num_workers is None:
         cpu_count = os.cpu_count() or 1
         worker_count = int(
-            os.environ.get("LINOSS_DATALOADER_WORKERS", min(4, max(1, cpu_count // 2)))
+            os.environ.get("LINOSS_DATALOADER_WORKERS", min(2, max(1, cpu_count // 2)))
         )
     else:
         worker_count = int(num_workers)
