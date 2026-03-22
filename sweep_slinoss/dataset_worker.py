@@ -1,6 +1,7 @@
 """Worker script that loads a dataset once onto the GPU and evaluates many configs."""
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -32,6 +33,62 @@ from sweep_slinoss.sweep_slinoss import (
     _write_completion_marker,
     _write_failure_marker,
 )
+
+
+FALLBACK_PATTERNS = (
+    "falling back to 'reference'",
+    'falling back to "reference"',
+    "failed warmup with CuTe/CUDA runtime error",
+)
+
+
+class _LineLoggerStream:
+    """Capture stdout/stderr lines, forward them to the worker log, and keep a copy."""
+
+    def __init__(self, logger: Callable[[str], None]) -> None:
+        self._logger = logger
+        self._parts: list[str] = []
+        self._buffer = ""
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        self._parts.append(text)
+        self._buffer += text
+        while "\n" in self._buffer:
+            line, self._buffer = self._buffer.split("\n", 1)
+            if line:
+                self._logger(line)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._buffer:
+            self._logger(self._buffer)
+            self._buffer = ""
+
+    def get_text(self) -> str:
+        return "".join(self._parts)
+
+
+def _write_scan_backend_status(
+    target_dir: str,
+    *,
+    used_reference_fallback: bool,
+    matching_lines: list[str],
+    status: str | None = None,
+) -> None:
+    status_path = os.path.join(target_dir, "_scan_backend_status.json")
+    payload = {
+        "scan_backend_requested": "CuTe",
+        "used_reference_fallback": used_reference_fallback,
+        "status": status
+        if status is not None
+        else ("reference_fallback" if used_reference_fallback else "cute_ok"),
+        "matching_lines": matching_lines,
+    }
+    with open(status_path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, sort_keys=True)
+
 
 def move_dataset_to_gpu(dataset, device):
     def _move(td):
@@ -87,6 +144,11 @@ def run_task_group(
     for i, task in enumerate(tasks):
         params = task["params"]
         target_dir = task["target_dir"]
+        stream = _LineLoggerStream(logger)
+        stream_text = ""
+        matching_lines: list[str] = []
+        scan_status = "unknown_due_to_failure"
+        used_reference_fallback = False
 
         if skip_existing and _is_completed_run(target_dir):
             continue
@@ -128,22 +190,29 @@ def run_task_group(
             if run_args.get("torch_compile", False):
                 model = torch.compile(model, mode=run_args.get("torch_compile_mode", "reduce-overhead"), dynamic=True)
 
-            trained_model = train_torch_model(
-                dataset,
-                model,
-                num_steps=run_args["num_steps"],
-                print_steps=run_args["print_steps"],
-                lr=run_args["lr"],
-                lr_scheduler=run_args["lr_scheduler"],
-                batch_size=run_args["batch_size"],
-                shuffle_seed=shufflekey,
-                output_dir=target_dir,
-                device=device,
-                dataloader_workers=0,
-                mixed_precision=False,
-                verbose=False,
-                progress_callback=None,
-            )
+            with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+                trained_model = train_torch_model(
+                    dataset,
+                    model,
+                    num_steps=run_args["num_steps"],
+                    print_steps=run_args["print_steps"],
+                    lr=run_args["lr"],
+                    lr_scheduler=run_args["lr_scheduler"],
+                    batch_size=run_args["batch_size"],
+                    shuffle_seed=shufflekey,
+                    output_dir=target_dir,
+                    device=device,
+                    dataloader_workers=0,
+                    mixed_precision=False,
+                    verbose=False,
+                    progress_callback=None,
+                )
+            scan_status = "cute_ok"
+            if used_reference_fallback:
+                logger(
+                    "[Worker] Scan backend fallback detected; "
+                    f"reference backend was used for {os.path.basename(target_dir)}"
+                )
             
             if os.path.exists(active_marker):
                 os.remove(active_marker)
@@ -175,6 +244,22 @@ def run_task_group(
             logger(f"[Worker] Run failed ({failure_kind}): {exc}")
             logger(traceback.format_exc())
         finally:
+            stream.flush()
+            stream_text = stream.get_text()
+            matching_lines = [
+                line
+                for line in stream_text.splitlines()
+                if any(pattern in line for pattern in FALLBACK_PATTERNS)
+            ]
+            used_reference_fallback = bool(matching_lines)
+            if used_reference_fallback:
+                scan_status = "reference_fallback"
+            _write_scan_backend_status(
+                target_dir,
+                used_reference_fallback=used_reference_fallback,
+                matching_lines=matching_lines,
+                status=scan_status,
+            )
             _cleanup_after_run()
 
     return {"tasks": len(tasks), "had_failures": had_failures}
