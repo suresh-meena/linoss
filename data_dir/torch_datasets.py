@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import tempfile
 from dataclasses import dataclass
 
 import numpy as np
@@ -133,6 +134,24 @@ def _load_random_split_uea_dataset(
     tuple[np.ndarray, np.ndarray, np.ndarray],
     int,
 ]:
+    def _cache_token(value) -> str:
+        values = np.asarray(value, dtype=np.uint32).reshape(-1)
+        if values.size == 0:
+            raise ValueError("Random split key must contain at least one value.")
+        return "_".join(str(int(v)) for v in values.tolist())
+
+    def _cache_path(base_dir: str, cache_key) -> str:
+        cache_dir = os.path.join(base_dir, "_split_index_cache")
+        os.makedirs(cache_dir, exist_ok=True)
+        return os.path.join(cache_dir, f"{_cache_token(cache_key)}.npz")
+
+    def _valid_indices(indices: np.ndarray, *, size: int) -> bool:
+        if indices.ndim != 1:
+            return False
+        if indices.size == 0:
+            return True
+        return bool(indices.min() >= 0 and indices.max() < size)
+
     base = os.path.join(data_dir, "processed", "UEA", name)
     data = np.asarray(_load_pickle(os.path.join(base, "data.pkl")), dtype=np.float32)
     labels, label_dim = _labels_to_indices(
@@ -144,14 +163,56 @@ def _load_random_split_uea_dataset(
     size = len(data)
     bound1 = int(size * 0.7)
     bound2 = int(size * 0.85)
-    
-    # Use standard numpy random instead of jax
-    rng = np.random.default_rng(key)
-    perm = rng.permutation(size)
-    
-    train_idx = perm[:bound1]
-    val_idx = perm[bound1:bound2]
-    test_idx = perm[bound2:]
+
+    split_cache_path = _cache_path(base, key)
+    train_idx = val_idx = test_idx = None
+    if os.path.exists(split_cache_path):
+        try:
+            with np.load(split_cache_path) as cached:
+                train_idx = np.asarray(cached["train_idx"], dtype=np.int64)
+                val_idx = np.asarray(cached["val_idx"], dtype=np.int64)
+                test_idx = np.asarray(cached["test_idx"], dtype=np.int64)
+            expected_total = size
+            actual_total = train_idx.size + val_idx.size + test_idx.size
+            if actual_total != expected_total:
+                train_idx = val_idx = test_idx = None
+            elif not (
+                _valid_indices(train_idx, size=size)
+                and _valid_indices(val_idx, size=size)
+                and _valid_indices(test_idx, size=size)
+            ):
+                train_idx = val_idx = test_idx = None
+        except Exception:
+            train_idx = val_idx = test_idx = None
+
+    if train_idx is None or val_idx is None or test_idx is None:
+        rng = np.random.default_rng(key)
+        perm = rng.permutation(size)
+
+        train_idx = np.asarray(perm[:bound1], dtype=np.int64)
+        val_idx = np.asarray(perm[bound1:bound2], dtype=np.int64)
+        test_idx = np.asarray(perm[bound2:], dtype=np.int64)
+
+        cache_dir = os.path.dirname(split_cache_path)
+        with tempfile.NamedTemporaryFile(
+            dir=cache_dir,
+            prefix=".split_",
+            suffix=".npz",
+            delete=False,
+        ) as tmp:
+            temp_path = tmp.name
+        try:
+            np.savez(
+                temp_path,
+                train_idx=train_idx,
+                val_idx=val_idx,
+                test_idx=test_idx,
+            )
+            os.replace(temp_path, split_cache_path)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
     return (
         (data[train_idx], data[val_idx], data[test_idx]),
         (labels[train_idx], labels[val_idx], labels[test_idx]),

@@ -3,33 +3,38 @@
 from __future__ import annotations
 
 import argparse
-import gc
+from collections import defaultdict
+from typing import NamedTuple
 import json
 import os
 import queue
+import subprocess
 import sys
 import time
-import traceback
-import multiprocessing as mp
+import tempfile
 import concurrent.futures
 
 import torch
+
+# Torch-only entrypoint: prevent accidental JAX GPU preallocation if JAX is
+# imported transitively by a dependency stack.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 # Ensure repository root is on sys.path when running from sweep_slinoss folder directly.
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
-from data_dir.torch_datasets import create_torch_dataset
 from run_experiment import _build_run_args
 from sweep_slinoss.sweep_slinoss import (
     DEFAULT_DATASETS,
     HYPERPARAM_GRID,
     _apply_sweep_params_to_config,
-    _classify_failure,
     _iter_grid,
     _resolve_seeds,
-    _safe_error_message,
+    _validate_slinoss_sweep_params,
+    PreflightValidationError,
 )
 
 try:
@@ -52,94 +57,160 @@ def _write_summary(path: str, summary: dict[str, object]) -> None:
         json.dump(summary, file, indent=2, sort_keys=True)
 
 
-def _run_single_dry_run_worker(q: mp.Queue, kwargs: dict, gpu_id: int) -> None:
-    # Set GPU isolation BEFORE importing torch in the worker process
-    import os
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    
-    try:
-        from train_torch import _key_to_seed, _set_torch_seed
-        from models.generate_torch_model import create_torch_model
-        from models.SLinOSS import ensure_slinoss_cuda_ready
-        from data_dir.torch_datasets import create_torch_dataset
-        import torch
-        from torch.nn import functional as F
+class DryRunTaskGroup(NamedTuple):
+    dataset: str
+    include_time: bool
+    seed: int
+    data_dir: str
+    use_presplit: bool
+    T: float
+    batch_size: int
+    datasetkey: int
+    model_seed: int
+    tasks: list[dict[str, object]]
 
-        ensure_slinoss_cuda_ready()
-        device = torch.device("cuda")
 
-        dataset = create_torch_dataset(
-            kwargs["data_dir"],
-            kwargs["dataset_name"],
-            kwargs["use_presplit"],
-            kwargs["include_time"],
-            kwargs["T"],
-            key=kwargs["datasetkey"],
+def _load_jsonl(path: str) -> list[dict[str, object]]:
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as file:
+        return [json.loads(line) for line in file if line.strip()]
+
+
+def _build_dry_run_task_groups(
+    *,
+    experiment_folder: str,
+    datasets: list[str],
+    seeds_per_config: int | None,
+    seeds: list[int] | None,
+) -> tuple[list[DryRunTaskGroup], int]:
+    combinations = _iter_grid(HYPERPARAM_GRID)
+    base_configs: dict[str, dict] = {}
+    groups: dict[tuple[str, bool, int], list[dict[str, object]]] = defaultdict(list)
+    total_runs = 0
+
+    for dataset_name in datasets:
+        config_path = os.path.join(experiment_folder, "SLinOSS", f"{dataset_name}.json")
+        with open(config_path, "r", encoding="utf-8") as file:
+            base_config = json.load(file)
+        base_configs[dataset_name] = base_config
+
+        for combo_idx, params in enumerate(combinations, start=1):
+            try:
+                _validate_slinoss_sweep_params(params)
+            except PreflightValidationError:
+                continue
+
+            run_config = _apply_sweep_params_to_config(base_config, params)
+            run_args, _ = _build_run_args("SLinOSS", dataset_name, run_config)
+            effective_seeds = _resolve_seeds(
+                config=run_config,
+                seeds_per_config=seeds_per_config,
+                seeds=seeds,
+            )
+
+            for seed in effective_seeds:
+                key = (dataset_name, bool(run_args["include_time"]), seed)
+                groups[key].append(
+                    {
+                        "combo_index": combo_idx,
+                        "params": params,
+                        "model_args": run_args["model_args"],
+                    }
+                )
+                total_runs += 1
+
+    task_groups: list[DryRunTaskGroup] = []
+    for (dataset_name, include_time, seed), tasks in groups.items():
+        base_config = base_configs[dataset_name]
+        gen = torch.Generator().manual_seed(seed)
+        datasetkey = torch.randint(0, 2**32, (1,), generator=gen).item()
+        model_seed = torch.randint(0, 2**32, (1,), generator=gen).item()
+
+        task_groups.append(
+            DryRunTaskGroup(
+                dataset=dataset_name,
+                include_time=include_time,
+                seed=seed,
+                data_dir=str(base_config["data_dir"]),
+                use_presplit=bool(_build_run_args("SLinOSS", dataset_name, base_config)[0]["use_presplit"]),
+                T=float(base_config["T"]),
+                batch_size=int(base_config["batch_size"]),
+                datasetkey=datasetkey,
+                model_seed=model_seed,
+                tasks=tasks,
+            )
         )
 
-        _set_torch_seed(kwargs["model_seed"])
-        model = create_torch_model(
-            "SLinOSS",
-            dataset.data_dim,
-            dataset.label_dim,
-            model_args=kwargs["model_args"],
-        ).to(device)
-        model.train()
-
-        batch_size = kwargs["batch_size"]
-        if batch_size > len(dataset.train):
-            raise ValueError(f"Batch size {batch_size} larger than training dataset size {len(dataset.train)}.")
-
-        x_all, lengths_all, labels_all = dataset.train.tensors
-        x = x_all[:batch_size].contiguous().to(device=device, non_blocking=True)
-        lengths = lengths_all[:batch_size].contiguous().to(device=device, non_blocking=True)
-        labels = labels_all[:batch_size].contiguous().to(device=device, non_blocking=True)
-
-        logits = model(x, lengths)
-        loss = F.cross_entropy(logits, labels)
-        loss.backward()
-        torch.cuda.synchronize(device=device)
-
-        q.put({"status": "passed"})
-    except Exception as exc:
-        q.put({
-            "status": "failed",
-            "failure_kind": _classify_failure(exc),
-            "error_type": exc.__class__.__name__,
-            "error_message": _safe_error_message(exc),
-            "traceback": traceback.format_exc(limit=25),
-        })
+    return task_groups, total_runs
 
 
-def _execute_isolated_dry_run(kwargs: dict, gpu_id: int) -> dict:
-    ctx = mp.get_context("spawn")
-    q = ctx.Queue()
-    p = ctx.Process(target=_run_single_dry_run_worker, args=(q, kwargs, gpu_id))
-    p.start()
+def _execute_dry_run_group(group: DryRunTaskGroup, gpu_id: int) -> list[dict[str, object]]:
+    env = os.environ.copy()
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    env.setdefault("JAX_PLATFORMS", "cpu")
 
-    res = None
-    while p.is_alive():
-        try:
-            res = q.get(timeout=0.1)
-            break
-        except queue.Empty:
-            continue
-
-    p.join()
-
-    if res is None:
-        try:
-            res = q.get(block=False)
-        except queue.Empty:
-            res = {
-                "status": "failed",
-                "failure_kind": "worker_crash",
-                "error_type": "Crash",
-                "error_message": f"Worker crashed with exitcode {p.exitcode}. Likely a C-level Segfault or severe OOM.",
-                "traceback": "",
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as payload_file:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as result_file:
+            payload = {
+                "dataset": group.dataset,
+                "include_time": group.include_time,
+                "seed": group.seed,
+                "data_dir": group.data_dir,
+                "use_presplit": group.use_presplit,
+                "T": group.T,
+                "batch_size": group.batch_size,
+                "datasetkey": group.datasetkey,
+                "model_seed": group.model_seed,
+                "tasks": group.tasks,
+                "result_path": result_file.name,
             }
-    return res
+            json.dump(payload, payload_file)
+            payload_path = payload_file.name
+            result_path = result_file.name
+
+    try:
+        cmd = [
+            sys.executable,
+            os.path.join(repo_root, "sweep_slinoss", "dry_run_dataset_worker.py"),
+            "--payload",
+            payload_path,
+        ]
+        result = subprocess.run(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        records = _load_jsonl(result_path)
+        if result.returncode != 0 and not records:
+            return [
+                {
+                    "dataset_name": group.dataset,
+                    "seed": group.seed,
+                    "combo_index": task["combo_index"],
+                    "params": task["params"],
+                    "model_args": task["model_args"],
+                    "elapsed_sec": 0.0,
+                    "status": "failed",
+                    "failure_kind": "worker_crash",
+                    "error_type": "Crash",
+                    "error_message": (
+                        f"Dry-run worker crashed with exitcode {result.returncode}."
+                    ),
+                    "traceback": result.stdout[-4000:],
+                }
+                for task in group.tasks
+            ]
+        return records
+    finally:
+        if os.path.exists(payload_path):
+            os.remove(payload_path)
+        if os.path.exists(result_path):
+            os.remove(result_path)
 
 
 def run_dry_run_grid(
@@ -152,19 +223,12 @@ def run_dry_run_grid(
     gpu_ids: list[int],
     show_progress: bool,
 ) -> None:
-    combinations = _iter_grid(HYPERPARAM_GRID)
-    base_configs: dict[str, dict] = {}
-    total_runs = 0
-    for dataset_name in datasets:
-        config_path = os.path.join(experiment_folder, "SLinOSS", f"{dataset_name}.json")
-        with open(config_path, "r", encoding="utf-8") as file:
-            base_configs[dataset_name] = json.load(file)
-        effective_seeds = _resolve_seeds(
-            config=base_configs[dataset_name],
-            seeds_per_config=seeds_per_config,
-            seeds=seeds,
-        )
-        total_runs += len(combinations) * len(effective_seeds)
+    task_groups, total_runs = _build_dry_run_task_groups(
+        experiment_folder=experiment_folder,
+        datasets=datasets,
+        seeds_per_config=seeds_per_config,
+        seeds=seeds,
+    )
 
     if os.path.exists(report_path):
         os.remove(report_path)
@@ -173,43 +237,6 @@ def run_dry_run_grid(
     gpu_queue = queue.Queue()
     for gid in gpu_ids:
         gpu_queue.put(gid)
-
-    dry_run_tasks = []
-    for dataset_name in datasets:
-        base_config = base_configs[dataset_name]
-        for combo_idx, params in enumerate(combinations, start=1):
-            run_config = _apply_sweep_params_to_config(base_config, params)
-            run_args, _ = _build_run_args("SLinOSS", dataset_name, run_config)
-            effective_seeds = _resolve_seeds(
-                config=run_config,
-                seeds_per_config=seeds_per_config,
-                seeds=seeds,
-            )
-
-            for seed in effective_seeds:
-                gen = torch.Generator().manual_seed(seed)
-                datasetkey = torch.randint(0, 2**32, (1,), generator=gen).item()
-                modelkey = torch.randint(0, 2**32, (1,), generator=gen).item()
-
-                kwargs = {
-                    "data_dir": run_args["data_dir"],
-                    "dataset_name": dataset_name,
-                    "use_presplit": run_args["use_presplit"],
-                    "include_time": bool(run_args["include_time"]),
-                    "T": run_args["T"],
-                    "datasetkey": datasetkey,
-                    "model_args": run_args["model_args"],
-                    "batch_size": int(run_args["batch_size"]),
-                    "model_seed": modelkey,
-                }
-                
-                dry_run_tasks.append({
-                    "kwargs": kwargs,
-                    "dataset_name": dataset_name,
-                    "seed": seed,
-                    "combo_index": combo_idx,
-                    "params": params,
-                })
 
     passed = 0
     failed = 0
@@ -226,46 +253,33 @@ def run_dry_run_grid(
             smoothing=0.1
         )
 
-    def _worker_task(task):
+    def _worker_task(group: DryRunTaskGroup):
         gid = gpu_queue.get()
-        start_time = time.time()
         try:
-            res = _execute_isolated_dry_run(task["kwargs"], gid)
-            elapsed_sec = round(time.time() - start_time, 4)
-            
-            record = {
-                "dataset_name": task["dataset_name"],
-                "seed": task["seed"],
-                "combo_index": task["combo_index"],
-                "params": task["params"],
-                "model_args": task["kwargs"]["model_args"],
-                "elapsed_sec": elapsed_sec,
-            }
-            record.update(res)
-            return record
+            return _execute_dry_run_group(group, gid)
         finally:
             gpu_queue.put(gid)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(gpu_ids)) as executor:
-        future_to_task = {executor.submit(_worker_task, task): task for task in dry_run_tasks}
-        for future in concurrent.futures.as_completed(future_to_task):
-            record = future.result()
-            
-            if record["status"] == "passed":
-                passed += 1
-            else:
-                failed += 1
-                failure_kind = record["failure_kind"]
-                failure_breakdown[failure_kind] = failure_breakdown.get(failure_kind, 0) + 1
-                if not show_progress:
-                    print(
-                        f"\nDry run failed (dataset={record['dataset_name']}, seed={record['seed']}, "
-                        f"combo={record['combo_index']}, failure_kind={failure_kind}): {record['error_message']}"
-                    )
+        future_to_group = {executor.submit(_worker_task, group): group for group in task_groups}
+        for future in concurrent.futures.as_completed(future_to_group):
+            records = future.result()
+            for record in records:
+                if record["status"] == "passed":
+                    passed += 1
+                else:
+                    failed += 1
+                    failure_kind = str(record["failure_kind"])
+                    failure_breakdown[failure_kind] = failure_breakdown.get(failure_kind, 0) + 1
+                    if not show_progress:
+                        print(
+                            f"\nDry run failed (dataset={record['dataset_name']}, seed={record['seed']}, "
+                            f"combo={record['combo_index']}, failure_kind={failure_kind}): {record['error_message']}"
+                        )
 
-            _write_jsonl(report_path, record)
-            if progress is not None:
-                progress.update(1)
+                _write_jsonl(report_path, record)
+                if progress is not None:
+                    progress.update(1)
 
     if progress is not None:
         progress.close()

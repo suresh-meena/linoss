@@ -5,6 +5,12 @@ import json
 import os
 import sys
 import traceback
+from typing import Callable
+
+# Torch-only worker: prevent accidental JAX GPU preallocation if JAX is imported
+# transitively by a dependency stack.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if repo_root not in sys.path:
@@ -34,14 +40,11 @@ def move_dataset_to_gpu(dataset, device):
     dataset.val = _move(dataset.val)
     dataset.test = _move(dataset.test)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--payload", type=str, required=True)
-    args = parser.parse_args()
-
-    with open(args.payload, "r") as f:
-        payload = json.load(f)
-
+def run_task_group(
+    payload: dict[str, object],
+    *,
+    logger: Callable[[str], None] = print,
+) -> dict[str, object]:
     dataset_name = payload["dataset"]
     include_time = payload["include_time"]
     seed = payload["seed"]
@@ -67,7 +70,7 @@ def main():
     modelkey = torch.randint(0, 2**32, (1,), generator=gen).item()
     shufflekey = torch.randint(0, 2**32, (1,), generator=gen).item()
 
-    print(f"[Worker] Loading dataset {dataset_name} (time={include_time}, seed={seed}) onto GPU...")
+    logger(f"[Worker] Loading dataset {dataset_name} (time={include_time}, seed={seed}) onto GPU...")
     dataset = create_torch_dataset(
         data_dir,
         dataset_name,
@@ -77,7 +80,9 @@ def main():
         key=datasetkey,
     )
     move_dataset_to_gpu(dataset, device)
-    print(f"[Worker] Dataset loaded. Starting {len(tasks)} runs...")
+    logger(f"[Worker] Dataset loaded. Starting {len(tasks)} runs...")
+
+    had_failures = False
 
     for i, task in enumerate(tasks):
         params = task["params"]
@@ -92,7 +97,7 @@ def main():
 
         overwrite_existing = os.path.isdir(target_dir) and not skip_existing
 
-        print(f"[Worker] Run {i+1}/{len(tasks)}: {os.path.basename(target_dir)}")
+        logger(f"[Worker] Run {i+1}/{len(tasks)}: {os.path.basename(target_dir)}")
         
         os.makedirs(target_dir, exist_ok=True)
         active_marker = os.path.join(target_dir, "_active_run.json")
@@ -166,10 +171,23 @@ def main():
                 failure_kind=failure_kind,
                 exc=exc,
             )
-            print(f"[Worker] Run failed ({failure_kind}): {exc}")
-            traceback.print_exc()
+            had_failures = True
+            logger(f"[Worker] Run failed ({failure_kind}): {exc}")
+            logger(traceback.format_exc())
         finally:
             _cleanup_after_run()
+
+    return {"tasks": len(tasks), "had_failures": had_failures}
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--payload", type=str, required=True)
+    args = parser.parse_args()
+
+    with open(args.payload, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    run_task_group(payload)
 
 if __name__ == "__main__":
     main()

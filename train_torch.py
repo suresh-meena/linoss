@@ -373,7 +373,7 @@ def train_torch_model(
                 else:
                     no_val_improvement = 0
 
-            if val_metric >= best_val_metric:
+            if val_metric > best_val_metric:
                 best_val_metric = val_metric
                 best_state_dict = {
                     key: value.detach().cpu().clone() for key, value in model.state_dict().items()

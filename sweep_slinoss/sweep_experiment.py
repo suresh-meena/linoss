@@ -109,68 +109,163 @@ def get_pending_task_groups(
         for (ds, inc, sd), ts in groups.items()
     ]
 
-def _execute_task_group(
+def _log_file_path(experiment_folder: str, gpu_id: int, group: TaskGroup) -> str:
+    log_dir = os.path.join(experiment_folder, "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    return os.path.join(log_dir, f"worker_gpu{gpu_id}_{group.dataset}_seed{group.seed}.log")
+
+
+def _start_persistent_worker(gpu_id: int) -> subprocess.Popen:
+    env = os.environ.copy()
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    cmd = [
+        sys.executable,
+        "-u",
+        os.path.join(repo_root, "sweep_slinoss", "persistent_dataset_worker.py"),
+    ]
+    process = subprocess.Popen(
+        cmd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    ready_line = process.stdout.readline()
+    if not ready_line:
+        raise RuntimeError(f"Persistent worker for GPU {gpu_id} exited before ready signal.")
+    ready = json.loads(ready_line)
+    if ready.get("status") != "ready":
+        raise RuntimeError(f"Persistent worker for GPU {gpu_id} returned invalid ready signal: {ready}")
+    return process
+
+
+def _shutdown_persistent_worker(process: subprocess.Popen | None) -> None:
+    if process is None:
+        return
+    if process.poll() is not None:
+        return
+    try:
+        assert process.stdin is not None
+        process.stdin.write(json.dumps({"type": "shutdown"}) + "\n")
+        process.stdin.flush()
+        process.wait(timeout=5)
+    except Exception:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _execute_task_group_via_worker(
+    process: subprocess.Popen,
     group: TaskGroup,
-    gpu_queue: queue.Queue,
+    gpu_id: int,
+    experiment_folder: str,
+    skip_existing: bool,
+) -> tuple[dict[str, object], str]:
+    payload = {
+        "dataset": group.dataset,
+        "include_time": group.include_time,
+        "seed": group.seed,
+        "experiment_folder": experiment_folder,
+        "skip_existing": skip_existing,
+        "tasks": group.tasks,
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as payload_file:
+        json.dump(payload, payload_file)
+        payload_path = payload_file.name
+
+    log_file = _log_file_path(experiment_folder, gpu_id, group)
+    with open(log_file, "w", encoding="utf-8"):
+        pass
+
+    try:
+        if process.poll() is not None:
+            raise RuntimeError(f"Persistent worker for GPU {gpu_id} is not running.")
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(
+            json.dumps(
+                {
+                    "type": "run",
+                    "payload_path": payload_path,
+                    "log_path": log_file,
+                }
+            )
+            + "\n"
+        )
+        process.stdin.flush()
+        response_line = process.stdout.readline()
+        if not response_line:
+            raise RuntimeError(f"Persistent worker for GPU {gpu_id} exited while running a group.")
+        return json.loads(response_line), log_file
+    finally:
+        if os.path.exists(payload_path):
+            os.remove(payload_path)
+
+
+def _gpu_worker_loop(
+    gpu_id: int,
+    group_queue: queue.Queue,
     experiment_folder: str,
     skip_existing: bool,
 ) -> int:
-    gpu_id = gpu_queue.get()
+    worker = _start_persistent_worker(gpu_id)
+    completed_groups = 0
     try:
-        env = os.environ.copy()
-        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
-            json.dump({
-                "dataset": group.dataset,
-                "include_time": group.include_time,
-                "seed": group.seed,
-                "experiment_folder": experiment_folder,
-                "skip_existing": skip_existing,
-                "tasks": group.tasks
-            }, f)
-            payload_path = f.name
-        
-        cmd = [
-            sys.executable,
-            os.path.join(repo_root, "sweep_slinoss", "dataset_worker.py"),
-            "--payload", payload_path
-        ]
-
-        log_dir = os.path.join(experiment_folder, "logs")
-        os.makedirs(log_dir, exist_ok=True)
-        log_file = os.path.join(log_dir, f"worker_gpu{gpu_id}_{group.dataset}_seed{group.seed}.log")
-
-        with open(log_file, "w") as f_out:
-            result = subprocess.run(cmd, env=env, stdout=f_out, stderr=subprocess.STDOUT, text=True)
-        
-        success = result.returncode == 0
-        os.remove(payload_path)
-        
-        if not success:
-            print(f"\n[GPU {gpu_id}] Group Crashed: Dataset={group.dataset}, Time={group.include_time}, Seed={group.seed}")
-            print(f"Check log for details: {log_file}")
-            # Try to print the last few lines of the log for immediate feedback
+        while True:
             try:
-                with open(log_file, "r") as f_log:
-                    lines = f_log.readlines()
-                    print("".join(lines[-10:]))
-            except Exception:
-                pass
-        else:
-            # Even if the worker finished successfully, check if any internal runs failed
+                group = group_queue.get_nowait()
+            except queue.Empty:
+                break
+
             try:
-                with open(log_file, "r") as f_log:
-                    content = f_log.read()
-                    if "[Worker] Run failed" in content:
-                        print(f"\n[GPU {gpu_id}] Group Finished with some failed runs: Dataset={group.dataset}, Seed={group.seed}. See log: {log_file}")
+                response, log_file = _execute_task_group_via_worker(
+                    worker,
+                    group,
+                    gpu_id,
+                    experiment_folder,
+                    skip_existing,
+                )
             except Exception:
-                pass
-            
-        return len(group.tasks)
+                _shutdown_persistent_worker(worker)
+                worker = _start_persistent_worker(gpu_id)
+                print(
+                    f"\n[GPU {gpu_id}] Group Crashed: Dataset={group.dataset}, Time={group.include_time}, Seed={group.seed}"
+                )
+                print(f"Check log for details: { _log_file_path(experiment_folder, gpu_id, group) }")
+                try:
+                    with open(_log_file_path(experiment_folder, gpu_id, group), "r", encoding="utf-8") as f_log:
+                        lines = f_log.readlines()
+                        print("".join(lines[-10:]))
+                except Exception:
+                    pass
+                continue
+
+            if response.get("status") != "ok":
+                print(
+                    f"\n[GPU {gpu_id}] Group Failed: Dataset={group.dataset}, Time={group.include_time}, Seed={group.seed}"
+                )
+                print(f"Check log for details: {log_file}")
+                try:
+                    with open(log_file, "r", encoding="utf-8") as f_log:
+                        lines = f_log.readlines()
+                        print("".join(lines[-10:]))
+                except Exception:
+                    pass
+                continue
+
+            if response.get("had_failures"):
+                print(
+                    f"\n[GPU {gpu_id}] Group Finished with some failed runs: Dataset={group.dataset}, Seed={group.seed}. See log: {log_file}"
+                )
+            completed_groups += 1
     finally:
-        gpu_queue.put(gpu_id)
+        _shutdown_persistent_worker(worker)
+
+    return completed_groups
 
 def run_concurrent_sweep(
     experiment_folder: str,
@@ -199,15 +294,18 @@ def run_concurrent_sweep(
         print(f"\n--- Iteration {iteration} ---")
         print(f"Found {len(pending_groups)} task groups ({total_tasks_this_round} total tasks).")
 
-        gpu_queue = queue.Queue()
-        for gid in gpu_ids:
-            gpu_queue.put(gid)
+        group_queue: queue.Queue = queue.Queue()
+        for group in pending_groups:
+            group_queue.put(group)
+
+        all_target_dirs = [task["target_dir"] for group in pending_groups for task in group.tasks]
+        last_completed = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(gpu_ids)) as executor:
             futures = [
                 executor.submit(
-                    _execute_task_group, group, gpu_queue, experiment_folder, skip_existing
-                ) for group in pending_groups
+                    _gpu_worker_loop, gpu_id, group_queue, experiment_folder, skip_existing
+                ) for gpu_id in gpu_ids
             ]
 
             if show_progress and tqdm is not None:
@@ -219,37 +317,31 @@ def run_concurrent_sweep(
                     leave=True,
                     smoothing=0.1
                 )
-                
-                # Smooth progress polling
-                all_target_dirs = [task["target_dir"] for group in pending_groups for task in group.tasks]
-                last_completed = 0
-                
-                while True:
-                    done_count = sum(1 for f in futures if f.done())
-                    
-                    current_completed = 0
-                    for target_dir in all_target_dirs:
-                        if _is_completed_run(target_dir) or os.path.exists(_failure_marker_path(target_dir)):
-                            current_completed += 1
-                            
-                    if current_completed > last_completed:
-                        pbar.update(current_completed - last_completed)
-                        total_processed += (current_completed - last_completed)
-                        last_completed = current_completed
-                        
-                    if done_count == len(futures):
-                        for future in futures:
-                            future.result() 
-                        break
-                        
-                    time.sleep(2.0)
-                    
+
+            while True:
+                done_count = sum(1 for f in futures if f.done())
+
+                current_completed = 0
+                for target_dir in all_target_dirs:
+                    if _is_completed_run(target_dir) or os.path.exists(_failure_marker_path(target_dir)):
+                        current_completed += 1
+
+                if current_completed > last_completed:
+                    delta = current_completed - last_completed
+                    total_processed += delta
+                    last_completed = current_completed
+                    if show_progress and tqdm is not None:
+                        pbar.update(delta)
+
+                if done_count == len(futures):
+                    for future in futures:
+                        future.result()
+                    break
+
+                time.sleep(2.0)
+
+            if show_progress and tqdm is not None:
                 pbar.close()
-            else:
-                for future in concurrent.futures.as_completed(futures):
-                    tasks_in_group = future.result()
-                    total_processed += tasks_in_group
-                    print(f"Group finished ({tasks_in_group} configs attempted). Total processed: {total_processed}")
                     
         iteration += 1
 
