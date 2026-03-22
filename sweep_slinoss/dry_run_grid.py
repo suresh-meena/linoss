@@ -11,6 +11,7 @@ import sys
 import time
 import traceback
 import multiprocessing as mp
+import concurrent.futures
 
 import torch
 
@@ -51,7 +52,12 @@ def _write_summary(path: str, summary: dict[str, object]) -> None:
         json.dump(summary, file, indent=2, sort_keys=True)
 
 
-def _run_single_dry_run_worker(q: mp.Queue, kwargs: dict) -> None:
+def _run_single_dry_run_worker(q: mp.Queue, kwargs: dict, gpu_id: int) -> None:
+    # Set GPU isolation BEFORE importing torch in the worker process
+    import os
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    
     try:
         from train_torch import _key_to_seed, _set_torch_seed
         from models.generate_torch_model import create_torch_model
@@ -106,10 +112,10 @@ def _run_single_dry_run_worker(q: mp.Queue, kwargs: dict) -> None:
         })
 
 
-def _execute_isolated_dry_run(kwargs: dict) -> dict:
+def _execute_isolated_dry_run(kwargs: dict, gpu_id: int) -> dict:
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
-    p = ctx.Process(target=_run_single_dry_run_worker, args=(q, kwargs))
+    p = ctx.Process(target=_run_single_dry_run_worker, args=(q, kwargs, gpu_id))
     p.start()
 
     res = None
@@ -143,6 +149,7 @@ def run_dry_run_grid(
     seeds_per_config: int | None,
     seeds: list[int] | None,
     report_path: str,
+    gpu_ids: list[int],
     show_progress: bool,
 ) -> None:
     combinations = _iter_grid(HYPERPARAM_GRID)
@@ -163,24 +170,13 @@ def run_dry_run_grid(
         os.remove(report_path)
     summary_path = os.path.splitext(report_path)[0] + "_summary.json"
 
-    progress = None
-    if show_progress and tqdm is not None:
-        progress = tqdm(
-            total=total_runs, 
-            desc="Dry Run", 
-            dynamic_ncols=True,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
-            leave=True,
-            smoothing=0.1
-        )
+    gpu_queue = queue.Queue()
+    for gid in gpu_ids:
+        gpu_queue.put(gid)
 
-    passed = 0
-    failed = 0
-    failure_breakdown: dict[str, int] = {}
-
+    dry_run_tasks = []
     for dataset_name in datasets:
         base_config = base_configs[dataset_name]
-
         for combo_idx, params in enumerate(combinations, start=1):
             run_config = _apply_sweep_params_to_config(base_config, params)
             run_args, _ = _build_run_args("SLinOSS", dataset_name, run_config)
@@ -191,7 +187,6 @@ def run_dry_run_grid(
             )
 
             for seed in effective_seeds:
-                start_time = time.time()
                 gen = torch.Generator().manual_seed(seed)
                 datasetkey = torch.randint(0, 2**32, (1,), generator=gen).item()
                 modelkey = torch.randint(0, 2**32, (1,), generator=gen).item()
@@ -207,50 +202,70 @@ def run_dry_run_grid(
                     "batch_size": int(run_args["batch_size"]),
                     "model_seed": modelkey,
                 }
+                
+                dry_run_tasks.append({
+                    "kwargs": kwargs,
+                    "dataset_name": dataset_name,
+                    "seed": seed,
+                    "combo_index": combo_idx,
+                    "params": params,
+                })
 
-                res = _execute_isolated_dry_run(kwargs)
+    passed = 0
+    failed = 0
+    failure_breakdown: dict[str, int] = {}
 
-                elapsed_sec = round(time.time() - start_time, 4)
+    progress = None
+    if show_progress and tqdm is not None:
+        progress = tqdm(
+            total=total_runs, 
+            desc="Dry Run", 
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            leave=True,
+            smoothing=0.1
+        )
 
-                if res["status"] == "passed":
-                    passed += 1
-                    record = {
-                        "status": "passed",
-                        "dataset_name": dataset_name,
-                        "seed": seed,
-                        "combo_index": combo_idx,
-                        "params": params,
-                        "model_args": run_args["model_args"],
-                        "elapsed_sec": elapsed_sec,
-                    }
-                else:
-                    failed += 1
-                    failure_kind = res["failure_kind"]
-                    failure_breakdown[failure_kind] = failure_breakdown.get(failure_kind, 0) + 1
-                    record = {
-                        "status": "failed",
-                        "dataset_name": dataset_name,
-                        "seed": seed,
-                        "combo_index": combo_idx,
-                        "params": params,
-                        "model_args": run_args["model_args"],
-                        "failure_kind": failure_kind,
-                        "error_type": res["error_type"],
-                        "error_message": res["error_message"],
-                        "traceback": res["traceback"],
-                        "elapsed_sec": elapsed_sec,
-                    }
+    def _worker_task(task):
+        gid = gpu_queue.get()
+        start_time = time.time()
+        try:
+            res = _execute_isolated_dry_run(task["kwargs"], gid)
+            elapsed_sec = round(time.time() - start_time, 4)
+            
+            record = {
+                "dataset_name": task["dataset_name"],
+                "seed": task["seed"],
+                "combo_index": task["combo_index"],
+                "params": task["params"],
+                "model_args": task["kwargs"]["model_args"],
+                "elapsed_sec": elapsed_sec,
+            }
+            record.update(res)
+            return record
+        finally:
+            gpu_queue.put(gid)
 
-                _write_jsonl(report_path, record)
-                if progress is not None:
-                    progress.update(1)
-                elif not show_progress:
-                    if record["status"] == "failed":
-                        print(
-                            "\nDry run failed "
-                            f"(dataset={dataset_name}, seed={seed}, combo={combo_idx}, "
-                            f"failure_kind={record['failure_kind']}): {record['error_message']}"
-                        )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(gpu_ids)) as executor:
+        future_to_task = {executor.submit(_worker_task, task): task for task in dry_run_tasks}
+        for future in concurrent.futures.as_completed(future_to_task):
+            record = future.result()
+            
+            if record["status"] == "passed":
+                passed += 1
+            else:
+                failed += 1
+                failure_kind = record["failure_kind"]
+                failure_breakdown[failure_kind] = failure_breakdown.get(failure_kind, 0) + 1
+                if not show_progress:
+                    print(
+                        f"\nDry run failed (dataset={record['dataset_name']}, seed={record['seed']}, "
+                        f"combo={record['combo_index']}, failure_kind={failure_kind}): {record['error_message']}"
+                    )
+
+            _write_jsonl(report_path, record)
+            if progress is not None:
+                progress.update(1)
 
     if progress is not None:
         progress.close()
@@ -309,6 +324,13 @@ if __name__ == "__main__":
         help="Path to the JSONL report file.",
     )
     parser.add_argument(
+        "--gpu_ids",
+        nargs="+",
+        type=int,
+        default=[0, 1],
+        help="List of GPU ids to use for concurrent dry-run execution.",
+    )
+    parser.add_argument(
         "--show_progress",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -326,5 +348,6 @@ if __name__ == "__main__":
         seeds_per_config=args.seeds_per_config,
         seeds=user_seeds,
         report_path=args.report_path,
+        gpu_ids=args.gpu_ids,
         show_progress=args.show_progress,
     )
