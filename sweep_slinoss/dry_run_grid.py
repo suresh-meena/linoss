@@ -78,7 +78,7 @@ def _run_single_dry_run_worker(q: mp.Queue, kwargs: dict, gpu_id: int) -> None:
             key=kwargs["datasetkey"],
         )
 
-        _set_torch_seed(_key_to_seed(kwargs["model_seed"]))
+        _set_torch_seed(kwargs["model_seed"])
         model = create_torch_model(
             "SLinOSS",
             dataset.data_dim,
