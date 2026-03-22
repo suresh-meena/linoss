@@ -9,11 +9,13 @@ import hashlib
 import math
 from typing import Callable
 
-import jax.random as jr
 import numpy as np
 import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+
+# Prevent file descriptor leaks in sweeps
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 from data_dir.torch_datasets import TorchDataset, create_torch_dataset
 from models.generate_torch_model import create_torch_model
@@ -136,14 +138,11 @@ def _make_loader(
     num_workers: int | None = None,
 ) -> DataLoader:
     if num_workers is None:
-        cpu_count = os.cpu_count() or 1
-        worker_count = int(
-            os.environ.get("LINOSS_DATALOADER_WORKERS", min(2, max(1, cpu_count // 2)))
-        )
+        worker_count = int(os.environ.get("LINOSS_DATALOADER_WORKERS", "0"))
     else:
         worker_count = int(num_workers)
-    if worker_count <= 0:
-        worker_count = 0
+    if worker_count < 0:
+        raise ValueError(f"DataLoader num_workers must be >= 0. Got {worker_count}.")
 
     loader_kwargs = dict(
         dataset=dataset,
@@ -155,6 +154,10 @@ def _make_loader(
         pin_memory=pin_memory,
     )
     if worker_count > 0:
+        # The sweep path already runs training inside spawned GPU worker processes.
+        # Keep DataLoader workers on `spawn` as well so they never fork a process
+        # after CUDA has been initialized in the trainer.
+        loader_kwargs["multiprocessing_context"] = "spawn"
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = 2
     return DataLoader(
@@ -166,6 +169,12 @@ def _infinite_batches(loader: DataLoader):
     while True:
         for batch in loader:
             yield batch
+
+
+def _close_iterator(iterator) -> None:
+    close = getattr(iterator, "close", None)
+    if close is not None:
+        close()
 
 
 def _first_nonfinite_index(tensor: torch.Tensor) -> tuple[int, ...] | None:
@@ -234,12 +243,17 @@ def train_torch_model(
     shuffle_seed: int,
     output_dir: str,
     device: torch.device,
+    dataloader_workers: int | None = None,
     mixed_precision: bool = False,
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
 ):
     if batch_size > len(dataset.train):
         raise ValueError("Batch size larger than training dataset size.")
+    if dataloader_workers is not None and int(dataloader_workers) < 0:
+        raise ValueError(
+            f"dataloader_workers must be >= 0 when provided. Got {dataloader_workers}."
+        )
 
     pin_memory = device.type == "cuda"
     train_generator = torch.Generator()
@@ -253,7 +267,7 @@ def train_torch_model(
         drop_last=True,
         generator=train_generator,
         pin_memory=pin_memory,
-        num_workers=None,
+        num_workers=dataloader_workers,
     )
     val_loader = _make_loader(
         dataset.val,
@@ -286,91 +300,107 @@ def train_torch_model(
     all_time = []
     start = time.time()
 
-    for step in range(num_steps):
-        model.train()
-        x, lengths, labels = next(train_batches)
-        x = x.to(device=device, non_blocking=True)
-        lengths = lengths.to(device=device, non_blocking=True)
-        labels = labels.to(device=device, non_blocking=True)
+    try:
+        for step in range(num_steps):
+            model.train()
+            x, lengths, labels = next(train_batches)
+            x = x.to(device=device, non_blocking=True)
+            lengths = lengths.to(device=device, non_blocking=True)
+            labels = labels.to(device=device, non_blocking=True)
 
-        bad_input = _first_nonfinite_index(x)
-        if bad_input is not None:
-            raise FloatingPointError(
-                "Encountered non-finite input batch values "
-                f"at training step {step + 1}, tensor index {bad_input}."
-            )
-
-        optimizer.zero_grad(set_to_none=True)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-            logits = model(x, lengths)
-            bad_logits = _first_nonfinite_index(logits)
-            if bad_logits is not None:
+            bad_input = _first_nonfinite_index(x)
+            if bad_input is not None:
                 raise FloatingPointError(
-                    "Encountered non-finite model logits "
-                    f"at training step {step + 1}, tensor index {bad_logits}."
+                    "Encountered non-finite input batch values "
+                    f"at training step {step + 1}, tensor index {bad_input}."
                 )
 
-            loss = F.cross_entropy(logits, labels)
-        loss_value = float(loss.item())
-        if not math.isfinite(loss_value):
-            raise FloatingPointError(
-                "Encountered non-finite loss "
-                f"at training step {step + 1}: loss={loss_value}."
-            )
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+                logits = model(x, lengths)
+                bad_logits = _first_nonfinite_index(logits)
+                if bad_logits is not None:
+                    raise FloatingPointError(
+                        "Encountered non-finite model logits "
+                        f"at training step {step + 1}, tensor index {bad_logits}."
+                    )
 
-        if use_amp:
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        else:
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        grad_norm_value = float(grad_norm)
-        if not math.isfinite(grad_norm_value):
-            raise FloatingPointError(
-                "Encountered non-finite gradient norm "
-                f"at training step {step + 1}: grad_norm={grad_norm_value}."
-            )
+                loss = F.cross_entropy(logits, labels)
+            loss_value = float(loss.item())
+            if not math.isfinite(loss_value):
+                raise FloatingPointError(
+                    "Encountered non-finite loss "
+                    f"at training step {step + 1}: loss={loss_value}."
+                )
 
-        if use_amp:
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            optimizer.step()
-        running_loss += loss_value
-
-        if (step + 1) % print_steps != 0:
-            continue
-
-        val_metric = _evaluate_accuracy(model, val_loader, device)
-        total_time = time.time() - start
-        if verbose:
-            print(
-                f"Step: {step + 1}, Loss: {running_loss / print_steps}, "
-                f"Validation metric: {val_metric}, Time: {total_time}"
-            )
-
-        all_train_metric.append(float("nan"))
-        all_val_metric.append(val_metric)
-        all_time.append(total_time)
-        if progress_callback is not None:
-            progress_callback(step + 1, num_steps)
-
-        if step > 0:
-            if val_metric <= best_val_metric:
-                no_val_improvement += 1
-                if no_val_improvement > 10:
-                    break
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             else:
-                no_val_improvement = 0
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            grad_norm_value = float(grad_norm)
+            if not math.isfinite(grad_norm_value):
+                raise FloatingPointError(
+                    "Encountered non-finite gradient norm "
+                    f"at training step {step + 1}: grad_norm={grad_norm_value}."
+                )
 
-        if val_metric >= best_val_metric:
-            best_val_metric = val_metric
-            best_state_dict = {
-                key: value.detach().cpu().clone() for key, value in model.state_dict().items()
-            }
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            running_loss += loss_value
 
-        running_loss = 0.0
+            if (step + 1) % print_steps != 0:
+                continue
+
+            val_metric = _evaluate_accuracy(model, val_loader, device)
+            total_time = time.time() - start
+            if verbose:
+                print(
+                    f"Step: {step + 1}, Loss: {running_loss / print_steps}, "
+                    f"Validation metric: {val_metric}, Time: {total_time}"
+                )
+
+            all_train_metric.append(float("nan"))
+            all_val_metric.append(val_metric)
+            all_time.append(total_time)
+            if progress_callback is not None:
+                progress_callback(step + 1, num_steps)
+
+            if step > 0:
+                if val_metric <= best_val_metric:
+                    no_val_improvement += 1
+                    if no_val_improvement > 10:
+                        break
+                else:
+                    no_val_improvement = 0
+
+            if val_metric >= best_val_metric:
+                best_val_metric = val_metric
+                best_state_dict = {
+                    key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+                }
+
+            running_loss = 0.0
+            _save_metrics(
+                output_dir,
+                print_steps,
+                all_train_metric,
+                all_val_metric,
+                all_time,
+                best_test_metric,
+            )
+            start = time.time()
+
+        if best_state_dict is not None:
+            model.load_state_dict(best_state_dict)
+        best_test_metric = _evaluate_accuracy(model, test_loader, device)
+        if verbose:
+            print(f"Test metric: {best_test_metric}")
         _save_metrics(
             output_dir,
             print_steps,
@@ -379,22 +409,21 @@ def train_torch_model(
             all_time,
             best_test_metric,
         )
-        start = time.time()
-
-    if best_state_dict is not None:
-        model.load_state_dict(best_state_dict)
-    best_test_metric = _evaluate_accuracy(model, test_loader, device)
-    if verbose:
-        print(f"Test metric: {best_test_metric}")
-    _save_metrics(
-        output_dir,
-        print_steps,
-        all_train_metric,
-        all_val_metric,
-        all_time,
-        best_test_metric,
-    )
-    return model
+        return model
+    finally:
+        _close_iterator(train_batches)
+        del train_batches
+        
+        # Explicitly shutdown DataLoader workers to prevent file descriptor leaks
+        if hasattr(train_loader, "_iterator") and train_loader._iterator is not None:
+            if hasattr(train_loader._iterator, "_shutdown_workers"):
+                train_loader._iterator._shutdown_workers()
+                
+        del train_loader
+        del val_loader
+        del test_loader
+        del optimizer
+        del scaler
 
 
 def create_dataset_model_and_train_torch(
@@ -418,6 +447,7 @@ def create_dataset_model_and_train_torch(
     batch_size,
     output_parent_dir="",
     id=None,
+    dataloader_workers: int | None = None,
     overwrite_output_dir: bool = False,
     auto_confirm_output_dir: bool = False,
     mixed_precision: bool = False,
@@ -452,10 +482,11 @@ def create_dataset_model_and_train_torch(
     )
     full_output_dir = os.path.join(output_parent_dir, output_dir)
 
-    key = jr.PRNGKey(seed)
-    datasetkey, modelkey, trainkey, _ = jr.split(key, 4)
-    # Match the extra split performed inside the JAX dataloader path before shuffling batches.
-    shufflekey, _ = jr.split(trainkey)
+    # Use native python/numpy/torch random to generate seeds instead of jax
+    gen = torch.Generator().manual_seed(seed)
+    datasetkey = torch.randint(0, 2**32, (1,), generator=gen).item()
+    modelkey = torch.randint(0, 2**32, (1,), generator=gen).item()
+    shufflekey = torch.randint(0, 2**32, (1,), generator=gen).item()
 
     if verbose:
         print(f"Creating dataset {dataset_name}")
@@ -470,7 +501,7 @@ def create_dataset_model_and_train_torch(
 
     if verbose:
         print(f"Creating model {model_name}")
-    _set_torch_seed(_key_to_seed(modelkey))
+    _set_torch_seed(modelkey)
     model = create_torch_model(
         model_name,
         dataset.data_dim,
@@ -495,9 +526,10 @@ def create_dataset_model_and_train_torch(
         lr=lr,
         lr_scheduler=lr_scheduler,
         batch_size=batch_size,
-        shuffle_seed=_key_to_seed(shufflekey),
+        shuffle_seed=shufflekey,
         output_dir=full_output_dir,
         device=device,
+        dataloader_workers=dataloader_workers,
         mixed_precision=mixed_precision,
         verbose=verbose,
         progress_callback=progress_callback,
