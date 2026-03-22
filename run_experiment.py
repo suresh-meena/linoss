@@ -7,9 +7,6 @@ import json
 import math
 from typing import Callable
 
-import diffrax
-
-from train import create_dataset_model_and_train
 from train_torch import create_dataset_model_and_train_torch
 
 
@@ -166,6 +163,8 @@ def _build_run_args(
     if model_name in TORCH_MODELS:
         run_args["torch_compile"] = _parse_bool(config.get("torch_compile", False))
         run_args["torch_compile_mode"] = config.get("torch_compile_mode", "reduce-overhead")
+        dataloader_workers = config.get("dataloader_workers", 0)
+        run_args["dataloader_workers"] = int(dataloader_workers)
     return run_args, run_fn
 
 

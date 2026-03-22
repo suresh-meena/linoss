@@ -137,12 +137,9 @@ def _make_loader(
     pin_memory: bool,
     num_workers: int | None = None,
 ) -> DataLoader:
-    if num_workers is None:
-        worker_count = int(os.environ.get("LINOSS_DATALOADER_WORKERS", "0"))
-    else:
-        worker_count = int(num_workers)
-    if worker_count < 0:
-        raise ValueError(f"DataLoader num_workers must be >= 0. Got {worker_count}.")
+    # Always use 0 workers for in-memory TensorDatasets to avoid IPC overhead
+    # and CUDA/spawn instability in PyTorch multiprocessing.
+    worker_count = 0
 
     loader_kwargs = dict(
         dataset=dataset,
@@ -153,13 +150,6 @@ def _make_loader(
         num_workers=worker_count,
         pin_memory=pin_memory,
     )
-    if worker_count > 0:
-        # The sweep path already runs training inside spawned GPU worker processes.
-        # Keep DataLoader workers on `spawn` as well so they never fork a process
-        # after CUDA has been initialized in the trainer.
-        loader_kwargs["multiprocessing_context"] = "spawn"
-        loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = 2
     return DataLoader(
         **loader_kwargs,
     )
@@ -255,7 +245,11 @@ def train_torch_model(
             f"dataloader_workers must be >= 0 when provided. Got {dataloader_workers}."
         )
 
-    pin_memory = device.type == "cuda"
+    dataset_is_on_gpu = False
+    if hasattr(dataset.train, "tensors") and len(dataset.train.tensors) > 0:
+        dataset_is_on_gpu = dataset.train.tensors[0].is_cuda
+
+    pin_memory = device.type == "cuda" and not dataset_is_on_gpu
     train_generator = torch.Generator()
     train_generator.manual_seed(shuffle_seed)
     use_amp = mixed_precision and device.type == "cuda"

@@ -58,6 +58,11 @@ REQUIRED_OUTPUT_FILES = (
     "test_metric.npy",
 )
 
+
+class PreflightValidationError(ValueError):
+    """Raised when a sweep config is known unsupported before launch."""
+
+
 def _iter_grid(grid: dict[str, list]) -> list[dict[str, object]]:
     keys = tuple(grid.keys())
     values = tuple(grid[k] for k in keys)
@@ -208,7 +213,7 @@ def _classify_failure(exc: BaseException) -> str:
     return exc.__class__.__name__.lower()
 
 
-def _cleanup_after_failure(path: str) -> None:
+def _cleanup_after_run() -> None:
     try:
         import torch
     except Exception:
@@ -219,8 +224,37 @@ def _cleanup_after_failure(path: str) -> None:
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
+
+def _cleanup_after_failure(path: str) -> None:
     if os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
+
+
+def _validate_slinoss_sweep_params(params: dict[str, object]) -> None:
+    d_model = int(params["hidden_dimension"])
+    d_head = int(params["head_dim"])
+    d_state = int(params["ssm_dimension"])
+
+    if d_model % d_head != 0:
+        raise PreflightValidationError(
+            f"Expected d_model to be divisible by d_head. Got d_model={d_model}, d_head={d_head}."
+        )
+
+    # The SLinOSS CUDA DU kernel has specific shape constraints.
+    # It requires D_padded >= P_padded (d_head >= d_state).
+    if d_head < d_state:
+        raise PreflightValidationError(
+            "Skipping known-unsupported SLinOSS CUDA kernel shape: d_head < d_state "
+            f"(d_model={d_model}, d_head={d_head}, d_state={d_state})."
+        )
+        
+    # This regime has repeatedly failed inside the published SLinOSS CUDA DU kernel
+    # with a D_padded/P_padded shape assertion. Skip it before launching work.
+    if d_head > 2 * d_state:
+        raise PreflightValidationError(
+            "Skipping known-unsupported SLinOSS CUDA kernel shape: d_head > 2 * d_state "
+            f"(d_model={d_model}, d_head={d_head}, d_state={d_state})."
+        )
 
 
 def _write_failure_marker(
@@ -383,6 +417,33 @@ def run_sweep(
                 target_dir = _expected_output_path(seed, dataset_name, run_args)
                 run_already_completed = _is_completed_run(target_dir)
 
+                try:
+                    _validate_slinoss_sweep_params(params)
+                except PreflightValidationError as exc:
+                    failure_kind = "invalid_config"
+                    failed_runs[failure_kind] = failed_runs.get(failure_kind, 0) + 1
+                    _append_failure_log(
+                        failure_log_path,
+                        {
+                            "dataset_name": dataset_name,
+                            "seed": seed,
+                            "combo_index": combo_idx,
+                            "params": params,
+                            "failure_kind": failure_kind,
+                            "error_type": exc.__class__.__name__,
+                            "error_message": _safe_error_message(exc),
+                            "target_dir": target_dir,
+                        },
+                    )
+                    if not show_progress and progress_queue is None:
+                        print(
+                            "Skipping invalid run "
+                            f"(dataset={dataset_name}, seed={seed}, combo={combo_idx}): "
+                            f"{_safe_error_message(exc, limit=300)}"
+                        )
+                    emit_progress(1.0)
+                    continue
+
                 if skip_existing and run_already_completed:
                     skipped_runs += 1
                     emit_progress(1.0)
@@ -390,8 +451,9 @@ def run_sweep(
                 overwrite_existing = os.path.isdir(target_dir) and (
                     not skip_existing or not run_already_completed
                 )
+                trained_model = None
                 try:
-                    run_fn(
+                    trained_model = run_fn(
                         seed=seed,
                         overwrite_output_dir=overwrite_existing,
                         auto_confirm_output_dir=False,
@@ -439,6 +501,9 @@ def run_sweep(
                         )
                     emit_progress(1.0 - reported_run_progress)
                     continue
+                finally:
+                    del trained_model
+                    _cleanup_after_run()
                 emit_progress(1.0 - reported_run_progress)
 
     if progress is not None:

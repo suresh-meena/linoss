@@ -6,7 +6,6 @@ import os
 import pickle
 from dataclasses import dataclass
 
-import jax.random as jr
 import numpy as np
 import torch
 from torch.utils.data import TensorDataset
@@ -145,9 +144,11 @@ def _load_random_split_uea_dataset(
     size = len(data)
     bound1 = int(size * 0.7)
     bound2 = int(size * 0.85)
-    # Mirror data_dir.datasets.dataset_generator so Torch and JAX runs share the same split.
-    permkey, _ = jr.split(key)
-    perm = np.asarray(jr.permutation(permkey, size))
+    
+    # Use standard numpy random instead of jax
+    rng = np.random.default_rng(key)
+    perm = rng.permutation(size)
+    
     train_idx = perm[:bound1]
     val_idx = perm[bound1:bound2]
     test_idx = perm[bound2:]

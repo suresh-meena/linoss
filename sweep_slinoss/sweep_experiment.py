@@ -1,233 +1,263 @@
-"""Two-GPU wrapper for the SLinOSS hyperparameter sweep."""
+"""Multi-GPU parameter sweep using functional programming (FP) principles.
+ThreadPoolExecutor + isolated subprocesses processing task groups."""
 
 from __future__ import annotations
 
 import argparse
-import multiprocessing as mp
+import concurrent.futures
+import json
 import os
 import queue
+import subprocess
 import sys
+import tempfile
+import time
+from collections import defaultdict
+from typing import NamedTuple
 
-# Ensure repository root is on sys.path when running from sweep_slinoss folder directly.
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
-from sweep_slinoss.sweep_slinoss import DEFAULT_DATASETS, run_sweep
+from run_experiment import _build_run_args
+from sweep_slinoss.sweep_slinoss import (
+    DEFAULT_DATASETS,
+    HYPERPARAM_GRID,
+    _iter_grid,
+    _apply_sweep_params_to_config,
+    _resolve_seeds,
+    _expected_output_path,
+    _is_completed_run,
+    _validate_slinoss_sweep_params,
+    _write_failure_marker,
+    _failure_marker_path,
+    PreflightValidationError,
+)
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
-GPU0_DATASETS = {"EigenWorms", "SelfRegulationSCP1", "Heartbeat"}
+class TaskGroup(NamedTuple):
+    dataset: str
+    include_time: bool
+    seed: int
+    tasks: list[dict]
 
-
-def _split_datasets(datasets: list[str]) -> tuple[list[str], list[str]]:
-    gpu0 = [dataset for dataset in datasets if dataset in GPU0_DATASETS]
-    gpu1 = [dataset for dataset in datasets if dataset not in GPU0_DATASETS]
-    return gpu0, gpu1
-
-
-def _run_on_gpu(
-    gpu_id: int,
-    *,
+def get_pending_task_groups(
     experiment_folder: str,
     datasets: list[str],
     seeds_per_config: int | None,
     seeds: list[int] | None,
     skip_existing: bool,
-    show_progress: bool,
-    progress_position: int,
-    tqdm_lock=None,
-    progress_queue=None,
-) -> None:
-    try:
-        # Isolate each worker to a single physical GPU so CUDA extensions that
-        # default to local device 0 cannot accidentally collide on GPU 0.
-        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+) -> list[TaskGroup]:
+    combinations = _iter_grid(HYPERPARAM_GRID)
+    groups = defaultdict(list)
 
-        import torch
+    for dataset_name in datasets:
+        config_path = os.path.join(experiment_folder, "SLinOSS", f"{dataset_name}.json")
+        if not os.path.exists(config_path):
+            print(f"Warning: Config not found for {dataset_name}. Skipping.")
+            continue
+            
+        with open(config_path, "r", encoding="utf-8") as file:
+            base_config = json.load(file)
 
-        if not datasets:
-            if progress_queue is not None:
-                progress_queue.put({"type": "total", "value": 0, "worker": f"GPU {gpu_id}"})
-            elif not show_progress:
-                print(f"[GPU {gpu_id}] No datasets assigned. Worker exiting.")
-            return
+        for params in combinations:
+            try:
+                _validate_slinoss_sweep_params(params)
+            except PreflightValidationError:
+                continue
 
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is not available, but GPU execution was requested.")
-        visible_count = torch.cuda.device_count()
-        if visible_count < 1:
-            raise RuntimeError(
-                f"Requested GPU {gpu_id}, but no visible CUDA devices were detected in worker."
+            run_config = _apply_sweep_params_to_config(base_config, params)
+            run_args, _ = _build_run_args("SLinOSS", dataset_name, run_config)
+            effective_seeds = _resolve_seeds(
+                config=run_config, seeds_per_config=seeds_per_config, seeds=seeds
             )
 
-        torch.cuda.set_device(0)
-        active_device = torch.cuda.current_device()
-        device_name = torch.cuda.get_device_name(active_device)
-        if not show_progress and progress_queue is None:
-            print(
-                f"[GPU {gpu_id}] Using CUDA device cuda:{active_device} ({device_name}), "
-                f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')}"
-            )
-            print(f"[GPU {gpu_id}] Running datasets: {datasets}")
-        run_sweep(
-            experiment_folder=experiment_folder,
-            datasets=datasets,
-            seeds_per_config=seeds_per_config,
-            seeds=seeds,
-            skip_existing=skip_existing,
-            show_progress=show_progress,
-            progress_desc=f"GPU {gpu_id}",
-            progress_position=progress_position,
-            tqdm_lock=tqdm_lock,
-            progress_queue=progress_queue,
-        )
-    finally:
-        if progress_queue is not None:
-            progress_queue.put({"type": "done", "worker": f"GPU {gpu_id}"})
+            for seed in effective_seeds:
+                target_dir = _expected_output_path(seed, dataset_name, run_args)
+                
+                # Check for an abandoned active marker from a previous segfault
+                active_marker = os.path.join(target_dir, "_active_run.json")
+                if os.path.exists(active_marker) and not _is_completed_run(target_dir):
+                    _write_failure_marker(
+                        target_dir,
+                        dataset_name=dataset_name,
+                        seed=seed,
+                        run_args=run_args,
+                        failure_kind="worker_crash",
+                        exc=RuntimeError("Worker process crashed (segfault/OOM) while running this task."),
+                    )
+                    os.remove(active_marker)
 
+                if skip_existing:
+                    if _is_completed_run(target_dir):
+                        continue
+                    if os.path.exists(_failure_marker_path(target_dir)):
+                        continue
 
-def _get_progress_message(progress_queue: mp.Queue, timeout: float | None):
-    try:
-        if timeout is None:
-            return progress_queue.get()
-        if timeout <= 0:
-            return progress_queue.get_nowait()
-        return progress_queue.get(timeout=timeout)
-    except queue.Empty:
-        return None
+                key = (dataset_name, params["include_time"], seed)
+                groups[key].append({
+                    "params": params,
+                    "target_dir": target_dir
+                })
 
-
-def run_two_gpu_sweep(
-    *,
-    experiment_folder: str,
-    datasets: list[str],
-    seeds_per_config: int | None,
-    seeds: list[int] | None,
-    skip_existing: bool,
-    gpu_ids: tuple[int, int],
-    show_progress: bool,
-) -> None:
-    import torch
-
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is not available, cannot run a two-GPU sweep.")
-    if torch.cuda.device_count() < 2:
-        raise RuntimeError(
-            f"Two GPUs requested, but only {torch.cuda.device_count()} GPU(s) detected."
-        )
-
-    gpu0_datasets, gpu1_datasets = _split_datasets(datasets)
-    if not show_progress:
-        print(f"GPU {gpu_ids[0]} datasets: {gpu0_datasets}")
-        print(f"GPU {gpu_ids[1]} datasets: {gpu1_datasets}")
-
-    tqdm_lock = mp.RLock()
-    progress_queue = mp.Queue() if show_progress else None
-
-    workers = [
-        mp.Process(
-            target=_run_on_gpu,
-            kwargs={
-                "gpu_id": gpu_ids[0],
-                "experiment_folder": experiment_folder,
-                "datasets": gpu0_datasets,
-                "seeds_per_config": seeds_per_config,
-                "seeds": seeds,
-                "skip_existing": skip_existing,
-                "show_progress": show_progress,
-                "progress_position": 0,
-                "tqdm_lock": tqdm_lock,
-                "progress_queue": progress_queue,
-            },
-        ),
-        mp.Process(
-            target=_run_on_gpu,
-            kwargs={
-                "gpu_id": gpu_ids[1],
-                "experiment_folder": experiment_folder,
-                "datasets": gpu1_datasets,
-                "seeds_per_config": seeds_per_config,
-                "seeds": seeds,
-                "skip_existing": skip_existing,
-                "show_progress": show_progress,
-                "progress_position": 1,
-                "tqdm_lock": tqdm_lock,
-                "progress_queue": progress_queue,
-            },
-        ),
+    return [
+        TaskGroup(dataset=ds, include_time=inc, seed=sd, tasks=ts) 
+        for (ds, inc, sd), ts in groups.items()
     ]
 
-    for worker in workers:
-        worker.start()
+def _execute_task_group(
+    group: TaskGroup,
+    gpu_queue: queue.Queue,
+    experiment_folder: str,
+    skip_existing: bool,
+) -> int:
+    gpu_id = gpu_queue.get()
+    try:
+        env = os.environ.copy()
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
 
-    if show_progress and progress_queue is not None:
-        try:
-            from tqdm import tqdm
-        except ImportError:
-            tqdm = None
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({
+                "dataset": group.dataset,
+                "include_time": group.include_time,
+                "seed": group.seed,
+                "experiment_folder": experiment_folder,
+                "skip_existing": skip_existing,
+                "tasks": group.tasks
+            }, f)
+            payload_path = f.name
+        
+        cmd = [
+            sys.executable,
+            os.path.join(repo_root, "sweep_slinoss", "dataset_worker.py"),
+            "--payload", payload_path
+        ]
 
-        if tqdm is not None:
-            total_tasks = 0
-            totals_received = 0
-            pending_updates = 0
-            completed_workers = 0
-            expected_workers = len(workers)
+        log_dir = os.path.join(experiment_folder, "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, f"worker_gpu{gpu_id}_{group.dataset}_seed{group.seed}.log")
 
-            while totals_received + completed_workers < expected_workers:
-                msg = _get_progress_message(progress_queue, timeout=0.1)
-                if msg is None:
-                    continue
-                if msg["type"] == "total":
-                    total_tasks += msg["value"]
-                    totals_received += 1
-                elif msg["type"] == "update":
-                    pending_updates += float(msg.get("value", 1.0))
-                elif msg["type"] == "done":
-                    completed_workers += 1
-
-            with tqdm(total=total_tasks, desc="Overall Sweep Progress", dynamic_ncols=True) as pbar:
-                if pending_updates:
-                    pbar.update(pending_updates)
-
-                while completed_workers < expected_workers:
-                    msg = _get_progress_message(progress_queue, timeout=0.1)
-                    if msg is None:
-                        continue
-                    if msg["type"] == "total":
-                        total_tasks += msg["value"]
-                        pbar.total = total_tasks
-                        pbar.refresh()
-                    elif msg["type"] == "update":
-                        pbar.update(float(msg.get("value", 1.0)))
-                    elif msg["type"] == "done":
-                        completed_workers += 1
-
-                while True:
-                    msg = _get_progress_message(progress_queue, timeout=0)
-                    if msg is None:
-                        break
-                    if msg["type"] == "total":
-                        total_tasks += msg["value"]
-                        pbar.total = total_tasks
-                        pbar.refresh()
-                    elif msg["type"] == "update":
-                        pbar.update(float(msg.get("value", 1.0)))
+        with open(log_file, "w") as f_out:
+            result = subprocess.run(cmd, env=env, stdout=f_out, stderr=subprocess.STDOUT, text=True)
+        
+        success = result.returncode == 0
+        os.remove(payload_path)
+        
+        if not success:
+            print(f"\n[GPU {gpu_id}] Group Crashed: Dataset={group.dataset}, Time={group.include_time}, Seed={group.seed}")
+            print(f"Check log for details: {log_file}")
+            # Try to print the last few lines of the log for immediate feedback
+            try:
+                with open(log_file, "r") as f_log:
+                    lines = f_log.readlines()
+                    print("".join(lines[-10:]))
+            except Exception:
+                pass
         else:
-            # tqdm is missing but show_progress was true, just wait
-            pass
+            # Even if the worker finished successfully, check if any internal runs failed
+            try:
+                with open(log_file, "r") as f_log:
+                    content = f_log.read()
+                    if "[Worker] Run failed" in content:
+                        print(f"\n[GPU {gpu_id}] Group Finished with some failed runs: Dataset={group.dataset}, Seed={group.seed}. See log: {log_file}")
+            except Exception:
+                pass
+            
+        return len(group.tasks)
+    finally:
+        gpu_queue.put(gpu_id)
 
-    for worker in workers:
-        worker.join()
+def run_concurrent_sweep(
+    experiment_folder: str,
+    datasets: list[str],
+    seeds_per_config: int | None,
+    seeds: list[int] | None,
+    skip_existing: bool,
+    gpu_ids: list[int],
+    show_progress: bool,
+):
+    print("Initializing multi-GPU grouped dataset execution...")
+    
+    total_processed = 0
+    iteration = 1
+    
+    while True:
+        pending_groups = get_pending_task_groups(
+            experiment_folder, datasets, seeds_per_config, seeds, skip_existing
+        )
+        
+        if not pending_groups:
+            print("\nNo pending tasks remaining.")
+            break
+            
+        total_tasks_this_round = sum(len(g.tasks) for g in pending_groups)
+        print(f"\n--- Iteration {iteration} ---")
+        print(f"Found {len(pending_groups)} task groups ({total_tasks_this_round} total tasks).")
 
-    failed_workers = [worker.pid for worker in workers if worker.exitcode != 0]
-    if failed_workers:
-        raise RuntimeError(f"Sweep workers failed: {failed_workers}")
+        gpu_queue = queue.Queue()
+        for gid in gpu_ids:
+            gpu_queue.put(gid)
 
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(gpu_ids)) as executor:
+            futures = [
+                executor.submit(
+                    _execute_task_group, group, gpu_queue, experiment_folder, skip_existing
+                ) for group in pending_groups
+            ]
+
+            if show_progress and tqdm is not None:
+                pbar = tqdm(
+                    total=total_tasks_this_round, 
+                    desc="Sweep", 
+                    dynamic_ncols=True,
+                    bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+                    leave=True,
+                    smoothing=0.1
+                )
+                
+                # Smooth progress polling
+                all_target_dirs = [task["target_dir"] for group in pending_groups for task in group.tasks]
+                last_completed = 0
+                
+                while True:
+                    done_count = sum(1 for f in futures if f.done())
+                    
+                    current_completed = 0
+                    for target_dir in all_target_dirs:
+                        if _is_completed_run(target_dir) or os.path.exists(_failure_marker_path(target_dir)):
+                            current_completed += 1
+                            
+                    if current_completed > last_completed:
+                        pbar.update(current_completed - last_completed)
+                        total_processed += (current_completed - last_completed)
+                        last_completed = current_completed
+                        
+                    if done_count == len(futures):
+                        for future in futures:
+                            future.result() 
+                        break
+                        
+                    time.sleep(2.0)
+                    
+                pbar.close()
+            else:
+                for future in concurrent.futures.as_completed(futures):
+                    tasks_in_group = future.result()
+                    total_processed += tasks_in_group
+                    print(f"Group finished ({tasks_in_group} configs attempted). Total processed: {total_processed}")
+                    
+        iteration += 1
+
+    print(f"\nSweep complete! Total configs processed across all iterations: {total_processed}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run the SLinOSS sweep split across two NVIDIA GPUs.",
+        description="Run the SLinOSS sweep grouped by dataset for extreme efficiency.",
     )
     parser.add_argument(
         "--experiment_folder",
@@ -239,7 +269,7 @@ if __name__ == "__main__":
         "--dataset_name",
         nargs="+",
         default=DEFAULT_DATASETS,
-        help="Datasets to include before fixed GPU partitioning.",
+        help="Datasets to include in the sweep.",
     )
     parser.add_argument(
         "--seeds_per_config",
@@ -251,7 +281,7 @@ if __name__ == "__main__":
         "--seeds",
         type=str,
         default=None,
-        help="Optional comma-separated list of seed values to use for all configs. Overrides JSON seeds and seeds_per_config.",
+        help="Optional comma-separated list of seed values to use for all configs. Overrides JSON seeds.",
     )
     parser.add_argument(
         "--skip_existing",
@@ -261,17 +291,23 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--gpu_ids",
-        nargs=2,
+        nargs="+",
         type=int,
         default=[0, 1],
-        metavar=("GPU_A", "GPU_B"),
-        help="Two GPU ids to use for the fixed dataset split.",
+        metavar="GPU_ID",
+        help="List of GPU ids to use for concurrent execution.",
     )
     parser.add_argument(
         "--show_progress",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Show per-GPU tqdm progress bars when tqdm is installed.",
+        help="Show tqdm progress bar when tqdm is installed.",
+    )
+    parser.add_argument(
+        "--dataloader_workers",
+        type=int,
+        default=0,
+        help="Ignored. Always runs with 0 workers per FP dataloader architecture.",
     )
     args = parser.parse_args()
 
@@ -279,17 +315,12 @@ if __name__ == "__main__":
     if args.seeds is not None:
         user_seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
 
-    try:
-        mp.set_start_method("spawn")
-    except RuntimeError:
-        pass
-
-    run_two_gpu_sweep(
+    run_concurrent_sweep(
         experiment_folder=args.experiment_folder,
         datasets=args.dataset_name,
         seeds_per_config=args.seeds_per_config,
         seeds=user_seeds,
         skip_existing=args.skip_existing,
-        gpu_ids=(args.gpu_ids[0], args.gpu_ids[1]),
+        gpu_ids=args.gpu_ids,
         show_progress=args.show_progress,
     )

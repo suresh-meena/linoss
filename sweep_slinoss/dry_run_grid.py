@@ -6,13 +6,13 @@ import argparse
 import gc
 import json
 import os
+import queue
 import sys
 import time
 import traceback
+import multiprocessing as mp
 
-import jax.random as jr
 import torch
-from torch.nn import functional as F
 
 # Ensure repository root is on sys.path when running from sweep_slinoss folder directly.
 repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -20,16 +20,12 @@ if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
 from data_dir.torch_datasets import create_torch_dataset
-from models.generate_torch_model import create_torch_model
-from models.SLinOSS import ensure_slinoss_cuda_ready
 from run_experiment import _build_run_args
-from train_torch import _key_to_seed, _set_torch_seed
 from sweep_slinoss.sweep_slinoss import (
     DEFAULT_DATASETS,
     HYPERPARAM_GRID,
     _apply_sweep_params_to_config,
     _classify_failure,
-    _cleanup_after_failure,
     _iter_grid,
     _resolve_seeds,
     _safe_error_message,
@@ -55,53 +51,89 @@ def _write_summary(path: str, summary: dict[str, object]) -> None:
         json.dump(summary, file, indent=2, sort_keys=True)
 
 
-def _take_batch(dataset, batch_size: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    if batch_size > len(dataset.train):
-        raise ValueError(
-            f"Batch size larger than training dataset size: batch_size={batch_size}, "
-            f"train_size={len(dataset.train)}."
+def _run_single_dry_run_worker(q: mp.Queue, kwargs: dict) -> None:
+    try:
+        from train_torch import _key_to_seed, _set_torch_seed
+        from models.generate_torch_model import create_torch_model
+        from models.SLinOSS import ensure_slinoss_cuda_ready
+        from data_dir.torch_datasets import create_torch_dataset
+        import torch
+        from torch.nn import functional as F
+
+        ensure_slinoss_cuda_ready()
+        device = torch.device("cuda")
+
+        dataset = create_torch_dataset(
+            kwargs["data_dir"],
+            kwargs["dataset_name"],
+            kwargs["use_presplit"],
+            kwargs["include_time"],
+            kwargs["T"],
+            key=kwargs["datasetkey"],
         )
-    x_all, lengths_all, labels_all = dataset.train.tensors
-    return (
-        x_all[:batch_size].contiguous(),
-        lengths_all[:batch_size].contiguous(),
-        labels_all[:batch_size].contiguous(),
-    )
+
+        _set_torch_seed(_key_to_seed(kwargs["model_seed"]))
+        model = create_torch_model(
+            "SLinOSS",
+            dataset.data_dim,
+            dataset.label_dim,
+            model_args=kwargs["model_args"],
+        ).to(device)
+        model.train()
+
+        batch_size = kwargs["batch_size"]
+        if batch_size > len(dataset.train):
+            raise ValueError(f"Batch size {batch_size} larger than training dataset size {len(dataset.train)}.")
+
+        x_all, lengths_all, labels_all = dataset.train.tensors
+        x = x_all[:batch_size].contiguous().to(device=device, non_blocking=True)
+        lengths = lengths_all[:batch_size].contiguous().to(device=device, non_blocking=True)
+        labels = labels_all[:batch_size].contiguous().to(device=device, non_blocking=True)
+
+        logits = model(x, lengths)
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+        torch.cuda.synchronize(device=device)
+
+        q.put({"status": "passed"})
+    except Exception as exc:
+        q.put({
+            "status": "failed",
+            "failure_kind": _classify_failure(exc),
+            "error_type": exc.__class__.__name__,
+            "error_message": _safe_error_message(exc),
+            "traceback": traceback.format_exc(limit=25),
+        })
 
 
-def _run_single_dry_run(
-    *,
-    dataset,
-    model_args: dict,
-    batch_size: int,
-    model_seed,
-    device: torch.device,
-) -> None:
-    _set_torch_seed(_key_to_seed(model_seed))
-    model = create_torch_model(
-        "SLinOSS",
-        dataset.data_dim,
-        dataset.label_dim,
-        model_args=model_args,
-    ).to(device)
-    model.train()
+def _execute_isolated_dry_run(kwargs: dict) -> dict:
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    p = ctx.Process(target=_run_single_dry_run_worker, args=(q, kwargs))
+    p.start()
 
-    x, lengths, labels = _take_batch(dataset, batch_size)
-    x = x.to(device=device, non_blocking=True)
-    lengths = lengths.to(device=device, non_blocking=True)
-    labels = labels.to(device=device, non_blocking=True)
+    res = None
+    while p.is_alive():
+        try:
+            res = q.get(timeout=0.1)
+            break
+        except queue.Empty:
+            continue
 
-    logits = model(x, lengths)
-    loss = F.cross_entropy(logits, labels)
-    loss.backward()
-    torch.cuda.synchronize(device=device)
+    p.join()
 
-    del loss
-    del logits
-    del x
-    del lengths
-    del labels
-    del model
+    if res is None:
+        try:
+            res = q.get(block=False)
+        except queue.Empty:
+            res = {
+                "status": "failed",
+                "failure_kind": "worker_crash",
+                "error_type": "Crash",
+                "error_message": f"Worker crashed with exitcode {p.exitcode}. Likely a C-level Segfault or severe OOM.",
+                "traceback": "",
+            }
+    return res
 
 
 def run_dry_run_grid(
@@ -113,9 +145,6 @@ def run_dry_run_grid(
     report_path: str,
     show_progress: bool,
 ) -> None:
-    ensure_slinoss_cuda_ready()
-    device = torch.device("cuda")
-
     combinations = _iter_grid(HYPERPARAM_GRID)
     base_configs: dict[str, dict] = {}
     total_runs = 0
@@ -136,15 +165,22 @@ def run_dry_run_grid(
 
     progress = None
     if show_progress and tqdm is not None:
-        progress = tqdm(total=total_runs, desc="SLinOSS Dry Run", dynamic_ncols=True)
+        progress = tqdm(
+            total=total_runs, 
+            desc="Dry Run", 
+            dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
+            leave=True,
+            smoothing=0.1
+        )
 
-    dataset_cache: dict[tuple[str, bool, int], object] = {}
     passed = 0
     failed = 0
     failure_breakdown: dict[str, int] = {}
 
     for dataset_name in datasets:
         base_config = base_configs[dataset_name]
+
         for combo_idx, params in enumerate(combinations, start=1):
             run_config = _apply_sweep_params_to_config(base_config, params)
             run_args, _ = _build_run_args("SLinOSS", dataset_name, run_config)
@@ -156,31 +192,28 @@ def run_dry_run_grid(
 
             for seed in effective_seeds:
                 start_time = time.time()
-                key = jr.PRNGKey(seed)
-                datasetkey, modelkey, _, _ = jr.split(key, 4)
-                include_time = bool(run_args["include_time"])
-                cache_key = (dataset_name, include_time, int(seed))
+                gen = torch.Generator().manual_seed(seed)
+                datasetkey = torch.randint(0, 2**32, (1,), generator=gen).item()
+                modelkey = torch.randint(0, 2**32, (1,), generator=gen).item()
 
-                try:
-                    dataset = dataset_cache.get(cache_key)
-                    if dataset is None:
-                        dataset = create_torch_dataset(
-                            run_args["data_dir"],
-                            dataset_name,
-                            run_args["use_presplit"],
-                            include_time,
-                            run_args["T"],
-                            key=datasetkey,
-                        )
-                        dataset_cache[cache_key] = dataset
+                kwargs = {
+                    "data_dir": run_args["data_dir"],
+                    "dataset_name": dataset_name,
+                    "use_presplit": run_args["use_presplit"],
+                    "include_time": bool(run_args["include_time"]),
+                    "T": run_args["T"],
+                    "datasetkey": datasetkey,
+                    "model_args": run_args["model_args"],
+                    "batch_size": int(run_args["batch_size"]),
+                    "model_seed": modelkey,
+                }
 
-                    _run_single_dry_run(
-                        dataset=dataset,
-                        model_args=run_args["model_args"],
-                        batch_size=int(run_args["batch_size"]),
-                        model_seed=modelkey,
-                        device=device,
-                    )
+                res = _execute_isolated_dry_run(kwargs)
+
+                elapsed_sec = round(time.time() - start_time, 4)
+
+                if res["status"] == "passed":
+                    passed += 1
                     record = {
                         "status": "passed",
                         "dataset_name": dataset_name,
@@ -188,14 +221,12 @@ def run_dry_run_grid(
                         "combo_index": combo_idx,
                         "params": params,
                         "model_args": run_args["model_args"],
-                        "elapsed_sec": round(time.time() - start_time, 4),
+                        "elapsed_sec": elapsed_sec,
                     }
-                    passed += 1
-                except Exception as exc:
-                    failure_kind = _classify_failure(exc)
-                    failure_breakdown[failure_kind] = failure_breakdown.get(failure_kind, 0) + 1
+                else:
                     failed += 1
-                    _cleanup_after_failure("")
+                    failure_kind = res["failure_kind"]
+                    failure_breakdown[failure_kind] = failure_breakdown.get(failure_kind, 0) + 1
                     record = {
                         "status": "failed",
                         "dataset_name": dataset_name,
@@ -204,15 +235,11 @@ def run_dry_run_grid(
                         "params": params,
                         "model_args": run_args["model_args"],
                         "failure_kind": failure_kind,
-                        "error_type": exc.__class__.__name__,
-                        "error_message": _safe_error_message(exc),
-                        "traceback": traceback.format_exc(limit=25),
-                        "elapsed_sec": round(time.time() - start_time, 4),
+                        "error_type": res["error_type"],
+                        "error_message": res["error_message"],
+                        "traceback": res["traceback"],
+                        "elapsed_sec": elapsed_sec,
                     }
-                finally:
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
 
                 _write_jsonl(report_path, record)
                 if progress is not None:
@@ -220,7 +247,7 @@ def run_dry_run_grid(
                 elif not show_progress:
                     if record["status"] == "failed":
                         print(
-                            "Dry run failed "
+                            "\nDry run failed "
                             f"(dataset={dataset_name}, seed={seed}, combo={combo_idx}, "
                             f"failure_kind={record['failure_kind']}): {record['error_message']}"
                         )
@@ -240,7 +267,7 @@ def run_dry_run_grid(
     _write_summary(summary_path, summary)
 
     print(
-        f"Dry-run summary: passed={passed}, failed={failed}, total_runs={total_runs}, "
+        f"\nDry-run summary: passed={passed}, failed={failed}, total_runs={total_runs}, "
         f"failure_breakdown={failure_breakdown or 'none'}"
     )
     print(f"Detailed report: {report_path}")
