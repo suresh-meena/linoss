@@ -45,6 +45,12 @@ class TaskGroup(NamedTuple):
     seed: int
     tasks: list[dict]
 
+
+def _clear_retryable_failure_marker(target_dir: str) -> None:
+    failure_marker = _failure_marker_path(target_dir)
+    if os.path.exists(failure_marker):
+        os.remove(failure_marker)
+
 def get_pending_task_groups(
     experiment_folder: str,
     datasets: list[str],
@@ -78,6 +84,7 @@ def get_pending_task_groups(
 
             for seed in effective_seeds:
                 target_dir = _expected_output_path(seed, dataset_name, run_args)
+                failure_marker = _failure_marker_path(target_dir)
                 
                 # Check for an abandoned active marker from a previous segfault
                 active_marker = os.path.join(target_dir, "_active_run.json")
@@ -95,8 +102,11 @@ def get_pending_task_groups(
                 if skip_existing:
                     if _is_completed_run(target_dir):
                         continue
-                    if os.path.exists(_failure_marker_path(target_dir)):
-                        continue
+
+                # Failed runs should be retried, not treated as completed.
+                # Remove the stale marker so this iteration starts from a clean state.
+                if os.path.exists(failure_marker):
+                    _clear_retryable_failure_marker(target_dir)
 
                 key = (dataset_name, params["include_time"], seed)
                 groups[key].append({
