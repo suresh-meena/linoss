@@ -117,6 +117,7 @@ def main() -> int:
         seed=args.seed,
         overwrite_output_dir=True,
         auto_confirm_output_dir=True,
+        check_numerics=True,
         verbose=True,
         **run_args,
     )

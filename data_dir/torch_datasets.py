@@ -14,7 +14,7 @@ from torch.utils.data import TensorDataset
 
 @dataclass
 class TorchDataset:
-    """Train/validation/test splits backed by CPU tensors."""
+    """Train/validation/test splits backed by tensors on a single device."""
 
     name: str
     train: TensorDataset
@@ -55,6 +55,23 @@ def _to_tensor_dataset(data: np.ndarray, labels: np.ndarray) -> TensorDataset:
         torch.from_numpy(lengths),
         torch.from_numpy(labels),
     )
+
+
+def move_torch_dataset_to_device(dataset: TorchDataset, device: torch.device) -> TorchDataset:
+    """Move all TorchDataset splits onto a target device."""
+
+    def _move_tensor_dataset(tensor_dataset: TensorDataset) -> TensorDataset:
+        tensors = getattr(tensor_dataset, "tensors", ())
+        if not tensors:
+            raise ValueError("TensorDataset must contain at least one tensor.")
+        return TensorDataset(
+            *tuple(tensor.to(device, non_blocking=device.type == "cuda") for tensor in tensors)
+        )
+
+    dataset.train = _move_tensor_dataset(dataset.train)
+    dataset.val = _move_tensor_dataset(dataset.val)
+    dataset.test = _move_tensor_dataset(dataset.test)
+    return dataset
 
 
 def _split_cache_token(value) -> str:

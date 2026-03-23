@@ -19,9 +19,8 @@ if repo_root not in sys.path:
 
 import torch
 from torch.nn import functional as F
-from torch.utils.data import TensorDataset
 
-from data_dir.torch_datasets import create_torch_dataset
+from data_dir.torch_datasets import create_torch_dataset, move_torch_dataset_to_device
 from models.SLinOSS import ensure_slinoss_cuda_ready
 from models.generate_torch_model import create_torch_model
 from train_torch import _set_torch_seed
@@ -30,16 +29,6 @@ from sweep_slinoss.sweep_slinoss import (
     _cleanup_after_run,
     _safe_error_message,
 )
-
-
-def _move_dataset_to_gpu(dataset, device: torch.device) -> None:
-    def _move(td):
-        return TensorDataset(*[t.to(device, non_blocking=True) for t in td.tensors])
-
-    dataset.train = _move(dataset.train)
-    dataset.val = _move(dataset.val)
-    dataset.test = _move(dataset.test)
-
 
 def _write_jsonl(path: str, record: dict[str, object]) -> None:
     parent = os.path.dirname(path)
@@ -84,7 +73,7 @@ def main() -> int:
         T,
         key=datasetkey,
     )
-    _move_dataset_to_gpu(dataset, device)
+    move_torch_dataset_to_device(dataset, device)
 
     if batch_size > len(dataset.train):
         raise ValueError(

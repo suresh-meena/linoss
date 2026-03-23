@@ -75,15 +75,23 @@ def _require_cuda_tensor(name: str, tensor: torch.Tensor) -> None:
         )
 
 
-class TransposedBatchNormEMA(nn.Module):
-    """Apply BatchNorm1d to ``(batch, time, channels)`` tensors."""
+class TokenBatchNormEMA(nn.Module):
+    """BatchNorm1d with EMA running stats over flattened token features."""
 
-    def __init__(self, d_model: int) -> None:
+    def __init__(self, d_model: int, *, momentum: float = 0.1) -> None:
         super().__init__()
-        self.bn = nn.BatchNorm1d(d_model, affine=True, track_running_stats=True)
+        self.bn = nn.BatchNorm1d(
+            d_model,
+            affine=True,
+            track_running_stats=True,
+            momentum=momentum,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.bn(x.transpose(1, 2)).transpose(1, 2)
+        batch, timesteps, channels = x.shape
+        x = x.reshape(batch * timesteps, channels)
+        x = self.bn(x)
+        return x.reshape(batch, timesteps, channels)
 
 
 class SiLUFeedForward(nn.Module):
@@ -111,6 +119,9 @@ class SiLUFeedForward(nn.Module):
 class StrictCudaCConv1dBackend:
     """CUDA-only causal-conv backend that never falls back silently."""
 
+    def __init__(self) -> None:
+        self._last_support_key: tuple[object, ...] | None = None
+
     def __call__(
         self,
         owner: SLinOSSMixer,
@@ -120,26 +131,28 @@ class StrictCudaCConv1dBackend:
         _require_cuda_tensor("inputs", x)
         if conv_state is not None:
             _require_cuda_tensor("convolution state", conv_state)
-        if not cconv1d_is_available():
-            detail = cconv1d_load_error()
-            raise RuntimeError(
-                "SLinOSS requires the compiled slinoss CUDA causal-conv extension. "
-                "The extension is not importable, so the model refuses to fall back "
-                "to the reference implementation."
-            ) from detail
-        if not cconv1d_cuda_supported(
-            x.transpose(1, 2),
-            owner.dw_weight,
-            initial_states=conv_state,
-            activation=None,
-        ):
-            raise RuntimeError(
-                "SLinOSS causal-conv CUDA execution is unsupported for the current "
-                "configuration. Expected CUDA float16/bfloat16/float32 tensors and "
-                f"d_conv in {{2, 3, 4}}. Got input device={x.device}, "
-                f"input dtype={x.dtype}, weight dtype={owner.dw_weight.dtype}, "
-                f"d_conv={owner.d_conv}."
-            )
+        support_key = (
+            tuple(x.shape),
+            x.dtype,
+            tuple(owner.dw_weight.shape),
+            owner.dw_weight.dtype,
+            None if conv_state is None else (tuple(conv_state.shape), conv_state.dtype),
+        )
+        if support_key != self._last_support_key:
+            if not cconv1d_cuda_supported(
+                x.transpose(1, 2),
+                owner.dw_weight,
+                initial_states=conv_state,
+                activation=None,
+            ):
+                raise RuntimeError(
+                    "SLinOSS causal-conv CUDA execution is unsupported for the current "
+                    "configuration. Expected CUDA float16/bfloat16/float32 tensors and "
+                    f"d_conv in {{2, 3, 4}}. Got input device={x.device}, "
+                    f"input dtype={x.dtype}, weight dtype={owner.dw_weight.dtype}, "
+                    f"d_conv={owner.d_conv}."
+                )
+            self._last_support_key = support_key
         return owner._apply_cconv_cuda(x, conv_state)
 
 
@@ -178,7 +191,7 @@ class SLinOSSBlock(nn.Module):
                 f"currently supports d_conv in {{2, 3, 4}}. Got d_conv={d_conv}."
             )
 
-        self.norm = TransposedBatchNormEMA(d_model)
+        self.norm = TokenBatchNormEMA(d_model)
         self.mixer = SLinOSSMixer(
             d_model,
             d_state=d_state,
@@ -248,8 +261,8 @@ class SLinOSSClassifier(nn.Module):
         ensure_slinoss_cuda_ready()
 
         self.input_proj = nn.Linear(input_dim, d_model)
-        self.blocks = nn.ModuleList(
-            [
+        self.blocks = nn.Sequential(
+            *[
                 SLinOSSBlock(
                     d_model=d_model,
                     d_state=d_state,
@@ -271,36 +284,21 @@ class SLinOSSClassifier(nn.Module):
                 for _ in range(n_layers)
             ]
         )
-        self.output_norm = TransposedBatchNormEMA(d_model)
+        self.output_norm = TokenBatchNormEMA(d_model)
         self.head = nn.Linear(d_model, num_classes)
 
-    @staticmethod
-    def _masked_mean(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        timesteps = x.shape[1]
-        idx = torch.arange(timesteps, device=x.device).unsqueeze(0)
-        mask = idx < lengths.unsqueeze(1)
-        mask = mask.unsqueeze(-1).to(dtype=x.dtype)
-        denom = lengths.clamp_min(1).to(dtype=x.dtype).unsqueeze(1)
-        return (x * mask).sum(dim=1) / denom
-
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        del lengths
         _require_cuda_tensor("inputs", x)
-        _require_cuda_tensor("sequence lengths", lengths)
         if x.ndim != 3:
             raise ValueError(
                 f"Expected inputs with shape (batch, time, channels). Got {tuple(x.shape)}."
             )
-        if lengths.ndim != 1 or lengths.shape[0] != x.shape[0]:
-            raise ValueError(
-                "Expected lengths with shape (batch,). "
-                f"Got {tuple(lengths.shape)} for batch size {x.shape[0]}."
-            )
 
         x = self.input_proj(x)
-        for block in self.blocks:
-            x = block(x)
+        x = self.blocks(x)
         x = self.output_norm(x)
-        pooled = self._masked_mean(x, lengths.long())
+        pooled = x.mean(dim=1)
         return self.head(pooled)
 
 

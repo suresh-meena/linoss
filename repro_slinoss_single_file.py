@@ -1,13 +1,27 @@
 #!/usr/bin/env python3
 """Single-file SLinOSS repro for the known EigenWorms non-finite failure.
 
-This script has two modes:
+Requirements for shipped repro usage
+------------------------------------
+- Python 3.10+
+- PyTorch with CUDA
+- A working local ``slinoss`` installation with its CUDA extensions
+- The frozen dataset bundle produced on the original machine, for example:
+  ``eigenworms_repro_bundle.pt``
+
+The maintainer-facing repro command is:
+
+    python repro_slinoss_single_file.py repro --bundle eigenworms_repro_bundle.pt
+
+In ``repro`` mode this script does not import any linoss model, sweep, or
+training wrapper. The model wrapper and training loop are defined inline here.
+
+This script also has a local helper mode:
 
 1. ``dump-bundle``: run locally in this repo to freeze the exact train/val/test
    split into a single ``.pt`` file.
-2. ``repro``: run from that bundle with an inline SLinOSS model wrapper and an
-   inline training loop. This mode avoids the linoss sweep and training
-   wrappers and only needs PyTorch plus the local ``slinoss`` package.
+2. ``repro``: run from that bundle with the inline SLinOSS model wrapper and
+   inline training loop.
 """
 
 from __future__ import annotations

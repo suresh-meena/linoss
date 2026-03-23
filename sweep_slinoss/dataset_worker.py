@@ -18,8 +18,7 @@ if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
 import torch
-from torch.utils.data import TensorDataset
-from data_dir.torch_datasets import create_torch_dataset
+from data_dir.torch_datasets import create_torch_dataset, move_torch_dataset_to_device
 from models.generate_torch_model import create_torch_model
 from train_torch import _prepare_output_dir, train_torch_model, _set_torch_seed
 from models.SLinOSS import ensure_slinoss_cuda_ready
@@ -90,13 +89,6 @@ def _write_scan_backend_status(
         json.dump(payload, file, indent=2, sort_keys=True)
 
 
-def move_dataset_to_gpu(dataset, device):
-    def _move(td):
-        return TensorDataset(*[t.to(device, non_blocking=True) for t in td.tensors])
-    dataset.train = _move(dataset.train)
-    dataset.val = _move(dataset.val)
-    dataset.test = _move(dataset.test)
-
 def run_task_group(
     payload: dict[str, object],
     *,
@@ -136,7 +128,7 @@ def run_task_group(
         T,
         key=datasetkey,
     )
-    move_dataset_to_gpu(dataset, device)
+    move_torch_dataset_to_device(dataset, device)
     logger(f"[Worker] Dataset loaded. Starting {len(tasks)} runs...")
 
     had_failures = False

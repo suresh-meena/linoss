@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import time
@@ -17,7 +18,11 @@ from torch.utils.data import TensorDataset
 # Prevent file descriptor leaks in sweeps
 torch.multiprocessing.set_sharing_strategy("file_system")
 
-from data_dir.torch_datasets import TorchDataset, create_torch_dataset
+from data_dir.torch_datasets import (
+    TorchDataset,
+    create_torch_dataset,
+    move_torch_dataset_to_device,
+)
 from models.generate_torch_model import create_torch_model
 
 
@@ -134,14 +139,6 @@ def _tensor_dataset_tensors(dataset: TensorDataset) -> tuple[torch.Tensor, ...]:
     return tuple(tensors)
 
 
-def _pin_tensor_dataset(dataset: TensorDataset) -> TensorDataset:
-    tensors = _tensor_dataset_tensors(dataset)
-    if tensors[0].device.type != "cpu":
-        return dataset
-    pinned = [tensor if tensor.is_pinned() else tensor.pin_memory() for tensor in tensors]
-    return TensorDataset(*pinned)
-
-
 def _epoch_limit(num_samples: int, batch_size: int, drop_last: bool) -> int:
     if drop_last:
         return num_samples - (num_samples % batch_size)
@@ -171,26 +168,27 @@ def _iter_tensor_batches(
     shuffle: bool,
     drop_last: bool,
     generator: torch.Generator | None,
-    device: torch.device,
     repeat: bool,
 ):
-    # Direct tensor indexing avoids DataLoader overhead and lets us overlap host
-    # copies with GPU compute when the dataset still lives on CPU.
+    # Direct tensor indexing avoids DataLoader overhead. SLinOSS batches are
+    # expected to already live on CUDA, so iteration is pure GPU indexing.
     tensors = _tensor_dataset_tensors(dataset)
     num_samples = int(tensors[0].shape[0])
     if num_samples == 0:
         raise ValueError("TensorDataset is empty.")
 
     source_device = tensors[0].device
-    needs_h2d = device.type == "cuda" and source_device.type == "cpu"
-    prefetch_stream = torch.cuda.Stream(device=device) if needs_h2d else None
+    if source_device.type != "cuda":
+        raise RuntimeError(
+            "SLinOSS tensor batches must be moved to CUDA before iteration."
+        )
 
     while True:
         order = _make_epoch_order(
             num_samples,
             shuffle=shuffle,
             generator=generator,
-            device=source_device if source_device.type == "cuda" else torch.device("cpu"),
+            device=source_device,
         )
         limit = _epoch_limit(num_samples, batch_size, drop_last)
         if limit == 0:
@@ -198,35 +196,9 @@ def _iter_tensor_batches(
                 continue
             return
 
-        if source_device.type == "cuda":
-            for start in range(0, limit, batch_size):
-                batch_idx = order[start : start + batch_size]
-                yield tuple(tensor.index_select(0, batch_idx) for tensor in tensors)
-        elif needs_h2d:
-            assert prefetch_stream is not None
-
-            def _load(start: int):
-                batch_idx = order[start : start + batch_size]
-                return tuple(
-                    tensor.index_select(0, batch_idx).to(device=device, non_blocking=True)
-                    for tensor in tensors
-                )
-
-            with torch.cuda.stream(prefetch_stream):
-                next_batch = _load(0)
-
-            for start in range(0, limit, batch_size):
-                torch.cuda.current_stream(device=device).wait_stream(prefetch_stream)
-                batch = next_batch
-                next_start = start + batch_size
-                if next_start < limit:
-                    with torch.cuda.stream(prefetch_stream):
-                        next_batch = _load(next_start)
-                yield batch
-        else:
-            for start in range(0, limit, batch_size):
-                batch_idx = order[start : start + batch_size]
-                yield tuple(tensor.index_select(0, batch_idx) for tensor in tensors)
+        for start in range(0, limit, batch_size):
+            batch_idx = order[start : start + batch_size]
+            yield tuple(tensor.index_select(0, batch_idx) for tensor in tensors)
 
         if not repeat:
             return
@@ -240,7 +212,7 @@ def _first_nonfinite_index(tensor: torch.Tensor) -> tuple[int, ...] | None:
     return tuple(int(i) for i in bad[0].tolist())
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def _evaluate_accuracy(
     model,
     dataset: TensorDataset,
@@ -258,7 +230,6 @@ def _evaluate_accuracy(
         shuffle=False,
         drop_last=False,
         generator=None,
-        device=device,
         repeat=False,
     ):
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
@@ -297,6 +268,16 @@ def _set_torch_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def _create_adam_optimizer(parameters, *, lr: float, device: torch.device):
+    parameters = list(parameters)
+    if device.type == "cuda":
+        try:
+            return torch.optim.Adam(parameters, lr=lr, fused=True)
+        except (TypeError, RuntimeError, ValueError):
+            pass
+    return torch.optim.Adam(parameters, lr=lr)
+
+
 def train_torch_model(
     dataset: TorchDataset,
     model,
@@ -311,9 +292,12 @@ def train_torch_model(
     device: torch.device,
     dataloader_workers: int | None = None,
     mixed_precision: bool = False,
+    check_numerics: bool = False,
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
 ):
+    if device.type != "cuda":
+        raise ValueError("SLinOSS Torch training requires device='cuda'.")
     if batch_size > len(dataset.train):
         raise ValueError("Batch size larger than training dataset size.")
     if dataloader_workers is not None and int(dataloader_workers) < 0:
@@ -321,14 +305,9 @@ def train_torch_model(
             f"dataloader_workers must be >= 0 when provided. Got {dataloader_workers}."
         )
 
-    dataset_is_on_gpu = False
     if hasattr(dataset.train, "tensors") and len(dataset.train.tensors) > 0:
-        dataset_is_on_gpu = dataset.train.tensors[0].is_cuda
-
-    if device.type == "cuda" and not dataset_is_on_gpu:
-        dataset.train = _pin_tensor_dataset(dataset.train)
-        dataset.val = _pin_tensor_dataset(dataset.val)
-        dataset.test = _pin_tensor_dataset(dataset.test)
+        if dataset.train.tensors[0].device != device:
+            dataset = move_torch_dataset_to_device(dataset, device)
 
     train_generator = torch.Generator()
     train_generator.manual_seed(shuffle_seed)
@@ -340,14 +319,17 @@ def train_torch_model(
         shuffle=True,
         drop_last=True,
         generator=train_generator,
-        device=device,
         repeat=True,
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr_scheduler(lr))
+    optimizer = _create_adam_optimizer(
+        model.parameters(),
+        lr=lr_scheduler(lr),
+        device=device,
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    running_loss = 0.0
+    running_loss = torch.zeros((), device=device, dtype=torch.float32)
     all_train_metric: list[float] = []
     all_val_metric = [0.0]
     best_val_metric = float("-inf")
@@ -362,30 +344,39 @@ def train_torch_model(
             model.train()
             x, lengths, labels = next(train_batches)
 
-            bad_input = _first_nonfinite_index(x)
-            if bad_input is not None:
-                raise FloatingPointError(
-                    "Encountered non-finite input batch values "
-                    f"at training step {step + 1}, tensor index {bad_input}."
-                )
-
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
-                logits = model(x, lengths)
-                bad_logits = _first_nonfinite_index(logits)
-                if bad_logits is not None:
+            if check_numerics:
+                bad_input = _first_nonfinite_index(x)
+                if bad_input is not None:
                     raise FloatingPointError(
-                        "Encountered non-finite model logits "
-                        f"at training step {step + 1}, tensor index {bad_logits}."
+                        "Encountered non-finite input batch values "
+                        f"at training step {step + 1}, tensor index {bad_input}."
                     )
 
+            optimizer.zero_grad(set_to_none=True)
+            autocast_ctx = (
+                torch.autocast(device_type=device.type, dtype=torch.float16, enabled=True)
+                if use_amp
+                else contextlib.nullcontext()
+            )
+            with autocast_ctx:
+                logits = model(x, lengths)
+                if check_numerics:
+                    bad_logits = _first_nonfinite_index(logits)
+                    if bad_logits is not None:
+                        raise FloatingPointError(
+                            "Encountered non-finite model logits "
+                            f"at training step {step + 1}, tensor index {bad_logits}."
+                        )
+
                 loss = F.cross_entropy(logits, labels)
-            loss_value = float(loss.item())
-            if not math.isfinite(loss_value):
-                raise FloatingPointError(
-                    "Encountered non-finite loss "
-                    f"at training step {step + 1}: loss={loss_value}."
-                )
+            running_loss += loss.detach().float()
+            if check_numerics:
+                loss_value = float(loss.item())
+                if not math.isfinite(loss_value):
+                    raise FloatingPointError(
+                        "Encountered non-finite loss "
+                        f"at training step {step + 1}: loss={loss_value}."
+                    )
 
             if use_amp:
                 scaler.scale(loss).backward()
@@ -394,19 +385,19 @@ def train_torch_model(
             else:
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            grad_norm_value = float(grad_norm)
-            if not math.isfinite(grad_norm_value):
-                raise FloatingPointError(
-                    "Encountered non-finite gradient norm "
-                    f"at training step {step + 1}: grad_norm={grad_norm_value}."
-                )
+            if check_numerics:
+                grad_norm_value = float(grad_norm)
+                if not math.isfinite(grad_norm_value):
+                    raise FloatingPointError(
+                        "Encountered non-finite gradient norm "
+                        f"at training step {step + 1}: grad_norm={grad_norm_value}."
+                    )
 
             if use_amp:
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 optimizer.step()
-            running_loss += loss_value
 
             if (step + 1) % print_steps != 0:
                 continue
@@ -418,9 +409,10 @@ def train_torch_model(
                 device=device,
             )
             total_time = time.time() - start
+            loss_value = float(running_loss.item()) / print_steps
             if verbose:
                 print(
-                    f"Step: {step + 1}, Loss: {running_loss / print_steps}, "
+                    f"Step: {step + 1}, Loss: {loss_value}, "
                     f"Validation metric: {val_metric}, Time: {total_time}"
                 )
 
@@ -443,7 +435,7 @@ def train_torch_model(
                 best_state_dict = {
                     key: value.detach().cpu().clone() for key, value in model.state_dict().items()
                 }
-            running_loss = 0.0
+            running_loss.zero_()
             _save_metrics(
                 output_dir,
                 print_steps,
@@ -504,6 +496,7 @@ def create_dataset_model_and_train_torch(
     overwrite_output_dir: bool = False,
     auto_confirm_output_dir: bool = False,
     mixed_precision: bool = False,
+    check_numerics: bool = False,
     torch_compile: bool = False,
     torch_compile_mode: str = "reduce-overhead",
     verbose: bool = True,
@@ -551,6 +544,7 @@ def create_dataset_model_and_train_torch(
         T,
         key=datasetkey,
     )
+    dataset = move_torch_dataset_to_device(dataset, device)
 
     if verbose:
         print(f"Creating model {model_name}")
@@ -584,6 +578,7 @@ def create_dataset_model_and_train_torch(
         device=device,
         dataloader_workers=dataloader_workers,
         mixed_precision=mixed_precision,
+        check_numerics=check_numerics,
         verbose=verbose,
         progress_callback=progress_callback,
     )
