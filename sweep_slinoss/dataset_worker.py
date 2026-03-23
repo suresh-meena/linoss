@@ -154,7 +154,7 @@ def run_task_group(
 
         run_config = _apply_sweep_params_to_config(base_config, params)
         run_args, _ = _build_run_args("SLinOSS", dataset_name, run_config)
-        run_args["print_steps"] = max(int(run_args["print_steps"]), 500)
+        run_args["print_steps"] = max(int(run_args["print_steps"]), 1000)
 
         overwrite_existing = os.path.isdir(target_dir) and not skip_existing
 
@@ -219,6 +219,7 @@ def run_task_group(
                     verbose=True,
                     progress_callback=None,
                     logger=run_logger,
+                    check_numerics=False,
                 )
             scan_status = "cute_ok"
             if used_reference_fallback:

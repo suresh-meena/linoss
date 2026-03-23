@@ -75,15 +75,18 @@ def _require_cuda_tensor(name: str, tensor: torch.Tensor) -> None:
         )
 
 
-class TransposedBatchNormEMA(nn.Module):
-    """Apply BatchNorm1d to ``(batch, time, channels)`` tensors."""
+class TokenBatchNormEMA(nn.Module):
+    """Apply BatchNorm1d to ``(batch, time, channels)`` tensors without transposes."""
 
     def __init__(self, d_model: int) -> None:
         super().__init__()
         self.bn = nn.BatchNorm1d(d_model, affine=True, track_running_stats=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.bn(x.transpose(1, 2)).transpose(1, 2)
+        batch, timesteps, channels = x.shape
+        x = x.reshape(batch * timesteps, channels)
+        x = self.bn(x)
+        return x.reshape(batch, timesteps, channels)
 
 
 class SiLUFeedForward(nn.Module):
@@ -178,7 +181,7 @@ class SLinOSSBlock(nn.Module):
                 f"currently supports d_conv in {{2, 3, 4}}. Got d_conv={d_conv}."
             )
 
-        self.norm = TransposedBatchNormEMA(d_model)
+        self.norm = TokenBatchNormEMA(d_model)
         self.mixer = SLinOSSMixer(
             d_model,
             d_state=d_state,
@@ -271,17 +274,12 @@ class SLinOSSClassifier(nn.Module):
                 for _ in range(n_layers)
             ]
         )
-        self.output_norm = TransposedBatchNormEMA(d_model)
+        self.output_norm = TokenBatchNormEMA(d_model)
         self.head = nn.Linear(d_model, num_classes)
 
     @staticmethod
-    def _masked_mean(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        timesteps = x.shape[1]
-        idx = torch.arange(timesteps, device=x.device).unsqueeze(0)
-        mask = idx < lengths.unsqueeze(1)
-        mask = mask.unsqueeze(-1).to(dtype=x.dtype)
-        denom = lengths.clamp_min(1).to(dtype=x.dtype).unsqueeze(1)
-        return (x * mask).sum(dim=1) / denom
+    def _mean_pool(x: torch.Tensor) -> torch.Tensor:
+        return x.mean(dim=1)
 
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         _require_cuda_tensor("inputs", x)
@@ -295,12 +293,14 @@ class SLinOSSClassifier(nn.Module):
                 "Expected lengths with shape (batch,). "
                 f"Got {tuple(lengths.shape)} for batch size {x.shape[0]}."
             )
+        # The Torch UEA pipeline always emits fixed-length sequences, so a plain
+        # mean over time is equivalent to masked pooling without the extra mask.
 
         x = self.input_proj(x)
         for block in self.blocks:
             x = block(x)
         x = self.output_norm(x)
-        pooled = self._masked_mean(x, lengths.long())
+        pooled = self._mean_pool(x)
         return self.head(pooled)
 
 

@@ -6,7 +6,6 @@ import os
 import shutil
 import time
 import hashlib
-import math
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
@@ -199,6 +198,70 @@ def _make_loader(
     )
 
 
+def _move_tensor_dataset_to_device(dataset, device: torch.device):
+    if not hasattr(dataset, "tensors") or len(dataset.tensors) == 0:
+        return dataset
+    if all(t.device == device for t in dataset.tensors):
+        return dataset
+    return type(dataset)(*[t.to(device=device, non_blocking=True) for t in dataset.tensors])
+
+
+def _move_dataset_to_device(dataset: TorchDataset, device: torch.device) -> TorchDataset:
+    dataset.train = _move_tensor_dataset_to_device(dataset.train, device)
+    dataset.val = _move_tensor_dataset_to_device(dataset.val, device)
+    dataset.test = _move_tensor_dataset_to_device(dataset.test, device)
+    return dataset
+
+
+def _iter_tensor_batches(
+    dataset,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    drop_last: bool,
+    generator: torch.Generator | None = None,
+):
+    if not hasattr(dataset, "tensors") or len(dataset.tensors) == 0:
+        raise ValueError("Expected a TensorDataset-backed split for tensor batching.")
+
+    tensors = dataset.tensors
+    size = tensors[0].shape[0]
+    limit = size if not drop_last else size - (size % batch_size)
+    if limit <= 0:
+        return
+
+    if shuffle:
+        indices = torch.randperm(size, generator=generator)
+        if indices.device != tensors[0].device:
+            indices = indices.to(device=tensors[0].device, non_blocking=True)
+        for start in range(0, limit, batch_size):
+            batch_indices = indices[start : start + batch_size]
+            yield tuple(torch.index_select(tensor, 0, batch_indices) for tensor in tensors)
+        return
+
+    for start in range(0, limit, batch_size):
+        stop = min(start + batch_size, size)
+        yield tuple(tensor[start:stop] for tensor in tensors)
+
+
+def _infinite_tensor_batches(
+    dataset,
+    *,
+    batch_size: int,
+    shuffle: bool,
+    drop_last: bool,
+    generator: torch.Generator | None = None,
+):
+    while True:
+        yield from _iter_tensor_batches(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            generator=generator,
+        )
+
+
 def _infinite_batches(loader: DataLoader):
     while True:
         for batch in loader:
@@ -220,21 +283,37 @@ def _first_nonfinite_index(tensor: torch.Tensor) -> tuple[int, ...] | None:
 
 
 @torch.no_grad()
-def _evaluate_accuracy(model, loader: DataLoader, device: torch.device) -> float:
+def _evaluate_accuracy(model, batches, device: torch.device) -> float:
     model.eval()
-    correct = 0
+    correct = torch.zeros((), device=device, dtype=torch.int64)
     total = 0
     use_amp = device.type == "cuda"
-    for x, lengths, labels in loader:
-        x = x.to(device=device, non_blocking=True)
-        lengths = lengths.to(device=device, non_blocking=True)
-        labels = labels.to(device=device, non_blocking=True)
+    for x, lengths, labels in batches:
+        if x.device != device:
+            x = x.to(device=device, non_blocking=True)
+        if lengths.device != device:
+            lengths = lengths.to(device=device, non_blocking=True)
+        if labels.device != device:
+            labels = labels.to(device=device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             logits = model(x, lengths)
         predictions = logits.argmax(dim=1)
-        correct += int((predictions == labels).sum().item())
+        correct += (predictions == labels).sum()
         total += int(labels.shape[0])
-    return float(correct / total)
+    if total == 0:
+        return 0.0
+    return float(correct.float().div(total).item())
+
+
+def _make_optimizer(model, *, lr: float, device: torch.device, logger: _RunLogger):
+    if device.type == "cuda":
+        try:
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True)
+            logger.log("Using fused Adam optimizer.")
+            return optimizer
+        except (TypeError, RuntimeError):
+            logger.log("Fused Adam unavailable; falling back to standard Adam.")
+    return torch.optim.Adam(model.parameters(), lr=lr)
 
 
 def _save_metrics(
@@ -282,6 +361,7 @@ def train_torch_model(
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
     logger: _RunLogger | None = None,
+    check_numerics: bool = False,
 ):
     owns_logger = False
     if logger is None:
@@ -311,17 +391,24 @@ def train_torch_model(
     if hasattr(dataset.train, "tensors") and len(dataset.train.tensors) > 0:
         dataset_is_on_gpu = dataset.train.tensors[0].is_cuda
 
+    if device.type == "cuda" and not dataset_is_on_gpu:
+        logger.log(f"Moving dataset {dataset.name} onto {device} before training.")
+        dataset = _move_dataset_to_device(dataset, device)
+        dataset_is_on_gpu = True
+
     pin_memory = device.type == "cuda" and not dataset_is_on_gpu
     train_generator = torch.Generator()
     train_generator.manual_seed(shuffle_seed)
     use_amp = mixed_precision and device.type == "cuda"
     effective_lr = lr_scheduler(lr)
+    use_tensor_batching = dataset_is_on_gpu
 
     logger.log(
         "Starting training run: "
         f"output_dir={output_dir}, device={device}, batch_size={batch_size}, "
         f"num_steps={num_steps}, print_steps={print_steps}, lr={effective_lr}, "
-        f"mixed_precision={mixed_precision}, dataset_on_gpu={dataset_is_on_gpu}"
+        f"mixed_precision={mixed_precision}, dataset_on_gpu={dataset_is_on_gpu}, "
+        f"tensor_batching={use_tensor_batching}, check_numerics={check_numerics}"
     )
     logger.log(
         "Dataset sizes: "
@@ -329,37 +416,63 @@ def train_torch_model(
         f"data_dim={dataset.data_dim}, label_dim={dataset.label_dim}"
     )
 
-    train_loader = _make_loader(
-        dataset.train,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=True,
-        generator=train_generator,
-        pin_memory=pin_memory,
-        num_workers=dataloader_workers,
-    )
-    val_loader = _make_loader(
-        dataset.val,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        pin_memory=pin_memory,
-        num_workers=0,
-    )
-    test_loader = _make_loader(
-        dataset.test,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        pin_memory=pin_memory,
-        num_workers=0,
-    )
+    train_loader = None
+    val_loader = None
+    test_loader = None
+    if use_tensor_batching:
+        train_batches = _infinite_tensor_batches(
+            dataset.train,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            generator=train_generator,
+        )
+        val_batches_factory = lambda: _iter_tensor_batches(
+            dataset.val,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+        test_batches_factory = lambda: _iter_tensor_batches(
+            dataset.test,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+    else:
+        train_loader = _make_loader(
+            dataset.train,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=True,
+            generator=train_generator,
+            pin_memory=pin_memory,
+            num_workers=dataloader_workers,
+        )
+        val_loader = _make_loader(
+            dataset.val,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=pin_memory,
+            num_workers=0,
+        )
+        test_loader = _make_loader(
+            dataset.test,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+            pin_memory=pin_memory,
+            num_workers=0,
+        )
+        train_batches = _infinite_batches(train_loader)
+        val_batches_factory = lambda: val_loader
+        test_batches_factory = lambda: test_loader
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=effective_lr)
+    optimizer = _make_optimizer(model, lr=effective_lr, device=device, logger=logger)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    train_batches = _infinite_batches(train_loader)
 
-    running_loss = 0.0
+    running_loss = torch.zeros((), device=device, dtype=torch.float32)
     all_train_metric: list[float] = []
     all_val_metric = [0.0]
     best_val_metric = float("-inf")
@@ -373,30 +486,35 @@ def train_torch_model(
         for step in range(num_steps):
             model.train()
             x, lengths, labels = next(train_batches)
-            x = x.to(device=device, non_blocking=True)
-            lengths = lengths.to(device=device, non_blocking=True)
-            labels = labels.to(device=device, non_blocking=True)
+            if x.device != device:
+                x = x.to(device=device, non_blocking=True)
+            if lengths.device != device:
+                lengths = lengths.to(device=device, non_blocking=True)
+            if labels.device != device:
+                labels = labels.to(device=device, non_blocking=True)
 
-            bad_input = _first_nonfinite_index(x)
-            if bad_input is not None:
-                raise FloatingPointError(
-                    "Encountered non-finite input batch values "
-                    f"at training step {step + 1}, tensor index {bad_input}."
-                )
+            if check_numerics:
+                bad_input = _first_nonfinite_index(x)
+                if bad_input is not None:
+                    raise FloatingPointError(
+                        "Encountered non-finite input batch values "
+                        f"at training step {step + 1}, tensor index {bad_input}."
+                    )
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 logits = model(x, lengths)
-                bad_logits = _first_nonfinite_index(logits)
-                if bad_logits is not None:
-                    raise FloatingPointError(
-                        "Encountered non-finite model logits "
-                        f"at training step {step + 1}, tensor index {bad_logits}."
-                    )
+                if check_numerics:
+                    bad_logits = _first_nonfinite_index(logits)
+                    if bad_logits is not None:
+                        raise FloatingPointError(
+                            "Encountered non-finite model logits "
+                            f"at training step {step + 1}, tensor index {bad_logits}."
+                        )
 
                 loss = F.cross_entropy(logits, labels)
-            loss_value = float(loss.item())
-            if not math.isfinite(loss_value):
+            if check_numerics and not bool(torch.isfinite(loss)):
+                loss_value = float(loss.detach().item())
                 raise FloatingPointError(
                     "Encountered non-finite loss "
                     f"at training step {step + 1}: loss={loss_value}."
@@ -409,8 +527,8 @@ def train_torch_model(
             else:
                 loss.backward()
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            grad_norm_value = float(grad_norm)
-            if not math.isfinite(grad_norm_value):
+            if check_numerics and not bool(torch.isfinite(grad_norm)):
+                grad_norm_value = float(grad_norm.detach().item())
                 raise FloatingPointError(
                     "Encountered non-finite gradient norm "
                     f"at training step {step + 1}: grad_norm={grad_norm_value}."
@@ -421,14 +539,14 @@ def train_torch_model(
                 scaler.update()
             else:
                 optimizer.step()
-            running_loss += loss_value
+            running_loss += loss.detach().to(dtype=running_loss.dtype)
 
             if (step + 1) % print_steps != 0:
                 continue
 
-            val_metric = _evaluate_accuracy(model, val_loader, device)
+            val_metric = _evaluate_accuracy(model, val_batches_factory(), device)
             total_time = time.time() - start
-            train_loss = running_loss / print_steps
+            train_loss = float((running_loss / print_steps).item())
             logger.log(
                 f"Step {step + 1}/{num_steps}: "
                 f"train_loss={train_loss:.6f}, "
@@ -436,7 +554,7 @@ def train_torch_model(
                 f"elapsed_sec={total_time:.2f}"
             )
 
-            all_train_metric.append(float("nan"))
+            all_train_metric.append(train_loss)
             all_val_metric.append(val_metric)
             all_time.append(total_time)
             if progress_callback is not None:
@@ -461,7 +579,7 @@ def train_torch_model(
                 }
                 logger.log(f"New best validation metric: {best_val_metric:.6f}")
 
-            running_loss = 0.0
+            running_loss.zero_()
             _save_metrics(
                 output_dir,
                 print_steps,
@@ -474,7 +592,7 @@ def train_torch_model(
 
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
-        best_test_metric = _evaluate_accuracy(model, test_loader, device)
+        best_test_metric = _evaluate_accuracy(model, test_batches_factory(), device)
         logger.log(f"Test metric: {best_test_metric:.6f}")
         _save_metrics(
             output_dir,
@@ -491,12 +609,12 @@ def train_torch_model(
     finally:
         _close_iterator(train_batches)
         del train_batches
-        
-        # Explicitly shutdown DataLoader workers to prevent file descriptor leaks
-        if hasattr(train_loader, "_iterator") and train_loader._iterator is not None:
+
+        # Explicitly shutdown DataLoader workers to prevent file descriptor leaks.
+        if train_loader is not None and hasattr(train_loader, "_iterator") and train_loader._iterator is not None:
             if hasattr(train_loader._iterator, "_shutdown_workers"):
                 train_loader._iterator._shutdown_workers()
-                
+
         del train_loader
         del val_loader
         del test_loader
