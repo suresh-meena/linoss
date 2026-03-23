@@ -83,6 +83,7 @@ def _build_dry_run_task_groups(
     datasets: list[str],
     seeds_per_config: int | None,
     seeds: list[int] | None,
+    max_tasks_per_worker: int,
 ) -> tuple[list[DryRunTaskGroup], int]:
     combinations = _iter_grid(HYPERPARAM_GRID)
     base_configs: dict[str, dict] = {}
@@ -120,6 +121,11 @@ def _build_dry_run_task_groups(
                 )
                 total_runs += 1
 
+    if max_tasks_per_worker < 1:
+        raise ValueError(
+            f"max_tasks_per_worker must be >= 1. Got {max_tasks_per_worker}."
+        )
+
     task_groups: list[DryRunTaskGroup] = []
     for (dataset_name, include_time, seed), tasks in groups.items():
         base_config = base_configs[dataset_name]
@@ -127,20 +133,21 @@ def _build_dry_run_task_groups(
         datasetkey = torch.randint(0, 2**32, (1,), generator=gen).item()
         model_seed = torch.randint(0, 2**32, (1,), generator=gen).item()
 
-        task_groups.append(
-            DryRunTaskGroup(
-                dataset=dataset_name,
-                include_time=include_time,
-                seed=seed,
-                data_dir=str(base_config["data_dir"]),
-                use_presplit=bool(_build_run_args("SLinOSS", dataset_name, base_config)[0]["use_presplit"]),
-                T=float(base_config["T"]),
-                batch_size=int(base_config["batch_size"]),
-                datasetkey=datasetkey,
-                model_seed=model_seed,
-                tasks=tasks,
+        for start in range(0, len(tasks), max_tasks_per_worker):
+            task_groups.append(
+                DryRunTaskGroup(
+                    dataset=dataset_name,
+                    include_time=include_time,
+                    seed=seed,
+                    data_dir=str(base_config["data_dir"]),
+                    use_presplit=bool(_build_run_args("SLinOSS", dataset_name, base_config)[0]["use_presplit"]),
+                    T=float(base_config["T"]),
+                    batch_size=int(base_config["batch_size"]),
+                    datasetkey=datasetkey,
+                    model_seed=model_seed,
+                    tasks=tasks[start : start + max_tasks_per_worker],
+                )
             )
-        )
 
     return task_groups, total_runs
 
@@ -222,12 +229,14 @@ def run_dry_run_grid(
     report_path: str,
     gpu_ids: list[int],
     show_progress: bool,
+    max_tasks_per_worker: int,
 ) -> None:
     task_groups, total_runs = _build_dry_run_task_groups(
         experiment_folder=experiment_folder,
         datasets=datasets,
         seeds_per_config=seeds_per_config,
         seeds=seeds,
+        max_tasks_per_worker=max_tasks_per_worker,
     )
 
     if os.path.exists(report_path):
@@ -350,6 +359,15 @@ if __name__ == "__main__":
         default=True,
         help="Show a tqdm progress bar when tqdm is installed.",
     )
+    parser.add_argument(
+        "--max_tasks_per_worker",
+        type=int,
+        default=1,
+        help=(
+            "Maximum number of dry-run configs to execute in a single worker subprocess. "
+            "Lower values reduce GPU VRAM growth from long-lived workers."
+        ),
+    )
     args = parser.parse_args()
 
     user_seeds = None
@@ -364,4 +382,5 @@ if __name__ == "__main__":
         report_path=args.report_path,
         gpu_ids=args.gpu_ids,
         show_progress=args.show_progress,
+        max_tasks_per_worker=args.max_tasks_per_worker,
     )

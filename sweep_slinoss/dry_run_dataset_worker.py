@@ -99,6 +99,9 @@ def main() -> int:
     for task in tasks:
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
+        model = None
+        logits = None
+        loss = None
         start_event.record()
         try:
             _set_torch_seed(model_seed)
@@ -128,7 +131,6 @@ def main() -> int:
                 "status": "passed",
             }
             _write_jsonl(result_path, record)
-            del model
         except Exception as exc:
             end_event.record()
             torch.cuda.synchronize(device=device)
@@ -148,7 +150,14 @@ def main() -> int:
             }
             _write_jsonl(result_path, record)
         finally:
-            _cleanup_after_run()
+            if model is not None:
+                model.zero_grad(set_to_none=True)
+            del loss
+            del logits
+            del model
+            del start_event
+            del end_event
+            _cleanup_after_run(release_cuda_cache=True)
 
     return 0
 
