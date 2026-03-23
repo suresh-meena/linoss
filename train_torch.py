@@ -7,7 +7,10 @@ import shutil
 import time
 import hashlib
 import math
-from typing import Callable
+import traceback
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Callable, TextIO
 
 import numpy as np
 import torch
@@ -19,6 +22,47 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 from data_dir.torch_datasets import TorchDataset, create_torch_dataset
 from models.generate_torch_model import create_torch_model
+
+
+@dataclass
+class _RunLogger:
+    path: str
+    verbose: bool
+    _handle: TextIO
+
+    def _format(self, message: str) -> str:
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        return f"[{timestamp}] {message.rstrip()}"
+
+    def log(self, message: str) -> None:
+        line = self._format(message)
+        self._handle.write(line + "\n")
+        self._handle.flush()
+        if self.verbose:
+            print(line, flush=True)
+
+    def log_block(self, text: str) -> None:
+        for line in text.rstrip("\n").splitlines():
+            self.log(line)
+
+    def exception(self, message: str) -> None:
+        self.log(message)
+        self.log_block(traceback.format_exc())
+
+    def close(self) -> None:
+        try:
+            self._handle.flush()
+        finally:
+            self._handle.close()
+
+
+def _create_run_logger(output_dir: str, *, verbose: bool) -> _RunLogger:
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "training.log")
+    handle = open(log_path, "a", encoding="utf-8")
+    logger = _RunLogger(path=log_path, verbose=verbose, _handle=handle)
+    logger.log(f"Training log initialized at {log_path}")
+    return logger
 
 
 def _key_to_seed(key) -> int:
@@ -43,7 +87,7 @@ def _prepare_output_dir(
             shutil.rmtree(output_dir)
             os.makedirs(output_dir)
             if verbose:
-                print(f"Directory {output_dir} has been deleted and recreated.")
+                print(f"Directory {output_dir} has been deleted and recreated.", flush=True)
             return
 
         user_input = input(
@@ -54,13 +98,13 @@ def _prepare_output_dir(
             shutil.rmtree(output_dir)
             os.makedirs(output_dir)
             if verbose:
-                print(f"Directory {output_dir} has been deleted and recreated.")
+                print(f"Directory {output_dir} has been deleted and recreated.", flush=True)
             return
         raise ValueError(f"Directory {output_dir} already exists. Exiting.")
 
     os.makedirs(output_dir)
     if verbose:
-        print(f"Directory {output_dir} has been created.")
+        print(f"Directory {output_dir} has been created.", flush=True)
 
 
 def _build_output_dir(
@@ -237,10 +281,28 @@ def train_torch_model(
     mixed_precision: bool = False,
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
+    logger: _RunLogger | None = None,
 ):
+    owns_logger = False
+    if logger is None:
+        logger = _create_run_logger(output_dir, verbose=verbose)
+        owns_logger = True
+
     if batch_size > len(dataset.train):
+        logger.log(
+            "Invalid training batch size "
+            f"{batch_size}; dataset only has {len(dataset.train)} samples."
+        )
+        if owns_logger:
+            logger.close()
         raise ValueError("Batch size larger than training dataset size.")
     if dataloader_workers is not None and int(dataloader_workers) < 0:
+        logger.log(
+            "Invalid dataloader_workers value "
+            f"{dataloader_workers}; expected a non-negative integer."
+        )
+        if owns_logger:
+            logger.close()
         raise ValueError(
             f"dataloader_workers must be >= 0 when provided. Got {dataloader_workers}."
         )
@@ -253,6 +315,19 @@ def train_torch_model(
     train_generator = torch.Generator()
     train_generator.manual_seed(shuffle_seed)
     use_amp = mixed_precision and device.type == "cuda"
+    effective_lr = lr_scheduler(lr)
+
+    logger.log(
+        "Starting training run: "
+        f"output_dir={output_dir}, device={device}, batch_size={batch_size}, "
+        f"num_steps={num_steps}, print_steps={print_steps}, lr={effective_lr}, "
+        f"mixed_precision={mixed_precision}, dataset_on_gpu={dataset_is_on_gpu}"
+    )
+    logger.log(
+        "Dataset sizes: "
+        f"train={len(dataset.train)}, val={len(dataset.val)}, test={len(dataset.test)}, "
+        f"data_dim={dataset.data_dim}, label_dim={dataset.label_dim}"
+    )
 
     train_loader = _make_loader(
         dataset.train,
@@ -280,7 +355,7 @@ def train_torch_model(
         num_workers=0,
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr_scheduler(lr))
+    optimizer = torch.optim.Adam(model.parameters(), lr=effective_lr)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     train_batches = _infinite_batches(train_loader)
 
@@ -353,11 +428,13 @@ def train_torch_model(
 
             val_metric = _evaluate_accuracy(model, val_loader, device)
             total_time = time.time() - start
-            if verbose:
-                print(
-                    f"Step: {step + 1}, Loss: {running_loss / print_steps}, "
-                    f"Validation metric: {val_metric}, Time: {total_time}"
-                )
+            train_loss = running_loss / print_steps
+            logger.log(
+                f"Step {step + 1}/{num_steps}: "
+                f"train_loss={train_loss:.6f}, "
+                f"validation_metric={val_metric:.6f}, "
+                f"elapsed_sec={total_time:.2f}"
+            )
 
             all_train_metric.append(float("nan"))
             all_val_metric.append(val_metric)
@@ -369,6 +446,10 @@ def train_torch_model(
                 if val_metric <= best_val_metric:
                     no_val_improvement += 1
                     if no_val_improvement > 10:
+                        logger.log(
+                            "Early stopping triggered after "
+                            f"{step + 1} steps due to no validation improvement."
+                        )
                         break
                 else:
                     no_val_improvement = 0
@@ -378,6 +459,7 @@ def train_torch_model(
                 best_state_dict = {
                     key: value.detach().cpu().clone() for key, value in model.state_dict().items()
                 }
+                logger.log(f"New best validation metric: {best_val_metric:.6f}")
 
             running_loss = 0.0
             _save_metrics(
@@ -393,8 +475,7 @@ def train_torch_model(
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
         best_test_metric = _evaluate_accuracy(model, test_loader, device)
-        if verbose:
-            print(f"Test metric: {best_test_metric}")
+        logger.log(f"Test metric: {best_test_metric:.6f}")
         _save_metrics(
             output_dir,
             print_steps,
@@ -404,6 +485,9 @@ def train_torch_model(
             best_test_metric,
         )
         return model
+    except Exception:
+        logger.exception("Training failed with an unexpected error.")
+        raise
     finally:
         _close_iterator(train_batches)
         del train_batches
@@ -418,6 +502,8 @@ def train_torch_model(
         del test_loader
         del optimizer
         del scaler
+        if owns_logger:
+            logger.close()
 
 
 def create_dataset_model_and_train_torch(
@@ -476,55 +562,74 @@ def create_dataset_model_and_train_torch(
     )
     full_output_dir = os.path.join(output_parent_dir, output_dir)
 
-    # Use native python/numpy/torch random to generate seeds instead of jax
-    gen = torch.Generator().manual_seed(seed)
-    datasetkey = torch.randint(0, 2**32, (1,), generator=gen).item()
-    modelkey = torch.randint(0, 2**32, (1,), generator=gen).item()
-    shufflekey = torch.randint(0, 2**32, (1,), generator=gen).item()
-
-    if verbose:
-        print(f"Creating dataset {dataset_name}")
-    dataset = create_torch_dataset(
-        data_dir,
-        dataset_name,
-        use_presplit,
-        include_time,
-        T,
-        key=datasetkey,
-    )
-
-    if verbose:
-        print(f"Creating model {model_name}")
-    _set_torch_seed(modelkey)
-    model = create_torch_model(
-        model_name,
-        dataset.data_dim,
-        dataset.label_dim,
-        model_args=model_args,
-    ).to(device)
-
-    if torch_compile:
-        model = torch.compile(model, mode=torch_compile_mode, dynamic=True)
-
     _prepare_output_dir(
         full_output_dir,
         overwrite=overwrite_output_dir,
         auto_confirm=auto_confirm_output_dir,
         verbose=verbose,
     )
-    return train_torch_model(
-        dataset,
-        model,
-        num_steps=num_steps,
-        print_steps=print_steps,
-        lr=lr,
-        lr_scheduler=lr_scheduler,
-        batch_size=batch_size,
-        shuffle_seed=shufflekey,
-        output_dir=full_output_dir,
-        device=device,
-        dataloader_workers=dataloader_workers,
-        mixed_precision=mixed_precision,
-        verbose=verbose,
-        progress_callback=progress_callback,
-    )
+    logger = _create_run_logger(full_output_dir, verbose=verbose)
+
+    # Use native python/numpy/torch random to generate seeds instead of jax
+    gen = torch.Generator().manual_seed(seed)
+    datasetkey = torch.randint(0, 2**32, (1,), generator=gen).item()
+    modelkey = torch.randint(0, 2**32, (1,), generator=gen).item()
+    shufflekey = torch.randint(0, 2**32, (1,), generator=gen).item()
+
+    try:
+        logger.log(
+            "Run configuration: "
+            f"seed={seed}, dataset={dataset_name}, include_time={include_time}, "
+            f"T={T}, num_steps={num_steps}, print_steps={print_steps}, "
+            f"batch_size={batch_size}, mixed_precision={mixed_precision}, "
+            f"torch_compile={torch_compile}, model_args={model_args}"
+        )
+        logger.log(f"Creating dataset {dataset_name}")
+        dataset = create_torch_dataset(
+            data_dir,
+            dataset_name,
+            use_presplit,
+            include_time,
+            T,
+            key=datasetkey,
+        )
+        logger.log(
+            "Dataset created: "
+            f"train={len(dataset.train)}, val={len(dataset.val)}, test={len(dataset.test)}"
+        )
+
+        logger.log(f"Creating model {model_name}")
+        _set_torch_seed(modelkey)
+        model = create_torch_model(
+            model_name,
+            dataset.data_dim,
+            dataset.label_dim,
+            model_args=model_args,
+        ).to(device)
+
+        if torch_compile:
+            logger.log(f"Compiling model with mode={torch_compile_mode}")
+            model = torch.compile(model, mode=torch_compile_mode, dynamic=True)
+
+        return train_torch_model(
+            dataset,
+            model,
+            num_steps=num_steps,
+            print_steps=print_steps,
+            lr=lr,
+            lr_scheduler=lr_scheduler,
+            batch_size=batch_size,
+            shuffle_seed=shufflekey,
+            output_dir=full_output_dir,
+            device=device,
+            dataloader_workers=dataloader_workers,
+            mixed_precision=mixed_precision,
+            verbose=verbose,
+            progress_callback=progress_callback,
+            logger=logger,
+        )
+    except Exception:
+        logger.exception("Training setup or execution failed.")
+        raise
+    finally:
+        logger.close()

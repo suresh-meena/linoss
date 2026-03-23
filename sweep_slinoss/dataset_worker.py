@@ -21,7 +21,7 @@ import torch
 from torch.utils.data import TensorDataset
 from data_dir.torch_datasets import create_torch_dataset
 from models.generate_torch_model import create_torch_model
-from train_torch import _prepare_output_dir, train_torch_model, _set_torch_seed
+from train_torch import _create_run_logger, _prepare_output_dir, train_torch_model, _set_torch_seed
 from models.SLinOSS import ensure_slinoss_cuda_ready
 from run_experiment import _build_run_args
 from sweep_slinoss.sweep_slinoss import (
@@ -57,8 +57,7 @@ class _LineLoggerStream:
         self._buffer += text
         while "\n" in self._buffer:
             line, self._buffer = self._buffer.split("\n", 1)
-            if line:
-                self._logger(line)
+            self._logger(line)
         return len(text)
 
     def flush(self) -> None:
@@ -166,31 +165,44 @@ def run_task_group(
         with open(active_marker, "w") as f:
             json.dump({"status": "running"}, f)
 
+        run_logger = None
         try:
-            _prepare_output_dir(
-                target_dir,
-                overwrite=overwrite_existing,
-                auto_confirm=True, # We already created it above, so auto-confirm
-                verbose=False,
-            )
-
-            # Re-create active marker inside the now-clean directory
-            with open(active_marker, "w") as f:
-                json.dump({"status": "running"}, f)
-
-            _set_torch_seed(modelkey)
-
-            model = create_torch_model(
-                "SLinOSS",
-                dataset.data_dim,
-                dataset.label_dim,
-                model_args=run_args["model_args"],
-            ).to(device)
-
-            if run_args.get("torch_compile", False):
-                model = torch.compile(model, mode=run_args.get("torch_compile_mode", "reduce-overhead"), dynamic=True)
-
             with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+                _prepare_output_dir(
+                    target_dir,
+                    overwrite=overwrite_existing,
+                    auto_confirm=True, # We already created it above, so auto-confirm
+                    verbose=False,
+                )
+
+                # Re-create active marker inside the now-clean directory
+                with open(active_marker, "w") as f:
+                    json.dump({"status": "running"}, f)
+
+                run_logger = _create_run_logger(target_dir, verbose=True)
+                run_logger.log(
+                    "Run configuration: "
+                    f"dataset={dataset_name}, seed={seed}, include_time={include_time}, "
+                    f"batch_size={run_args['batch_size']}, num_steps={run_args['num_steps']}, "
+                    f"print_steps={run_args['print_steps']}, model_args={run_args['model_args']}"
+                )
+
+                _set_torch_seed(modelkey)
+
+                model = create_torch_model(
+                    "SLinOSS",
+                    dataset.data_dim,
+                    dataset.label_dim,
+                    model_args=run_args["model_args"],
+                ).to(device)
+
+                if run_args.get("torch_compile", False):
+                    model = torch.compile(
+                        model,
+                        mode=run_args.get("torch_compile_mode", "reduce-overhead"),
+                        dynamic=True,
+                    )
+
                 trained_model = train_torch_model(
                     dataset,
                     model,
@@ -204,8 +216,9 @@ def run_task_group(
                     device=device,
                     dataloader_workers=0,
                     mixed_precision=False,
-                    verbose=False,
+                    verbose=True,
                     progress_callback=None,
+                    logger=run_logger,
                 )
             scan_status = "cute_ok"
             if used_reference_fallback:
@@ -213,7 +226,7 @@ def run_task_group(
                     "[Worker] Scan backend fallback detected; "
                     f"reference backend was used for {os.path.basename(target_dir)}"
                 )
-            
+
             if os.path.exists(active_marker):
                 os.remove(active_marker)
 
@@ -223,7 +236,7 @@ def run_task_group(
                 seed=seed,
                 run_args=run_args,
             )
-            
+
             del model
             del trained_model
 
@@ -241,9 +254,16 @@ def run_task_group(
                 exc=exc,
             )
             had_failures = True
+            if run_logger is not None:
+                run_logger.verbose = False
+                run_logger.exception(
+                    f"Run failed ({failure_kind}) for dataset={dataset_name}, seed={seed}."
+                )
             logger(f"[Worker] Run failed ({failure_kind}): {exc}")
             logger(traceback.format_exc())
         finally:
+            if run_logger is not None:
+                run_logger.close()
             stream.flush()
             stream_text = stream.get_text()
             matching_lines = [
