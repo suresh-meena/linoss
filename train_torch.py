@@ -12,7 +12,7 @@ from typing import Callable
 import numpy as np
 import torch
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import TensorDataset
 
 # Prevent file descriptor leaks in sweeps
 torch.multiprocessing.set_sharing_strategy("file_system")
@@ -127,44 +127,109 @@ def _build_output_dir(
     return full_name
 
 
-def _make_loader(
-    dataset,
+def _tensor_dataset_tensors(dataset: TensorDataset) -> tuple[torch.Tensor, ...]:
+    tensors = getattr(dataset, "tensors", ())
+    if not tensors:
+        raise ValueError("TensorDataset must contain at least one tensor.")
+    return tuple(tensors)
+
+
+def _pin_tensor_dataset(dataset: TensorDataset) -> TensorDataset:
+    tensors = _tensor_dataset_tensors(dataset)
+    if tensors[0].device.type != "cpu":
+        return dataset
+    pinned = [tensor if tensor.is_pinned() else tensor.pin_memory() for tensor in tensors]
+    return TensorDataset(*pinned)
+
+
+def _epoch_limit(num_samples: int, batch_size: int, drop_last: bool) -> int:
+    if drop_last:
+        return num_samples - (num_samples % batch_size)
+    return num_samples
+
+
+def _make_epoch_order(
+    num_samples: int,
+    *,
+    shuffle: bool,
+    generator: torch.Generator | None,
+    device: torch.device,
+) -> torch.Tensor:
+    if shuffle:
+        order = torch.randperm(num_samples, generator=generator)
+    else:
+        order = torch.arange(num_samples)
+    if device.type == "cuda":
+        order = order.to(device=device)
+    return order
+
+
+def _iter_tensor_batches(
+    dataset: TensorDataset,
     *,
     batch_size: int,
     shuffle: bool,
     drop_last: bool,
-    generator: torch.Generator | None = None,
-    pin_memory: bool,
-    num_workers: int | None = None,
-) -> DataLoader:
-    # Always use 0 workers for in-memory TensorDatasets to avoid IPC overhead
-    # and CUDA/spawn instability in PyTorch multiprocessing.
-    worker_count = 0
+    generator: torch.Generator | None,
+    device: torch.device,
+    repeat: bool,
+):
+    # Direct tensor indexing avoids DataLoader overhead and lets us overlap host
+    # copies with GPU compute when the dataset still lives on CPU.
+    tensors = _tensor_dataset_tensors(dataset)
+    num_samples = int(tensors[0].shape[0])
+    if num_samples == 0:
+        raise ValueError("TensorDataset is empty.")
 
-    loader_kwargs = dict(
-        dataset=dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=drop_last,
-        generator=generator,
-        num_workers=worker_count,
-        pin_memory=pin_memory,
-    )
-    return DataLoader(
-        **loader_kwargs,
-    )
+    source_device = tensors[0].device
+    needs_h2d = device.type == "cuda" and source_device.type == "cpu"
+    prefetch_stream = torch.cuda.Stream(device=device) if needs_h2d else None
 
-
-def _infinite_batches(loader: DataLoader):
     while True:
-        for batch in loader:
-            yield batch
+        order = _make_epoch_order(
+            num_samples,
+            shuffle=shuffle,
+            generator=generator,
+            device=source_device if source_device.type == "cuda" else torch.device("cpu"),
+        )
+        limit = _epoch_limit(num_samples, batch_size, drop_last)
+        if limit == 0:
+            if repeat:
+                continue
+            return
 
+        if source_device.type == "cuda":
+            for start in range(0, limit, batch_size):
+                batch_idx = order[start : start + batch_size]
+                yield tuple(tensor.index_select(0, batch_idx) for tensor in tensors)
+        elif needs_h2d:
+            assert prefetch_stream is not None
 
-def _close_iterator(iterator) -> None:
-    close = getattr(iterator, "close", None)
-    if close is not None:
-        close()
+            def _load(start: int):
+                batch_idx = order[start : start + batch_size]
+                return tuple(
+                    tensor.index_select(0, batch_idx).to(device=device, non_blocking=True)
+                    for tensor in tensors
+                )
+
+            with torch.cuda.stream(prefetch_stream):
+                next_batch = _load(0)
+
+            for start in range(0, limit, batch_size):
+                torch.cuda.current_stream(device=device).wait_stream(prefetch_stream)
+                batch = next_batch
+                next_start = start + batch_size
+                if next_start < limit:
+                    with torch.cuda.stream(prefetch_stream):
+                        next_batch = _load(next_start)
+                yield batch
+        else:
+            for start in range(0, limit, batch_size):
+                batch_idx = order[start : start + batch_size]
+                yield tuple(tensor.index_select(0, batch_idx) for tensor in tensors)
+
+        if not repeat:
+            return
 
 
 def _first_nonfinite_index(tensor: torch.Tensor) -> tuple[int, ...] | None:
@@ -176,15 +241,26 @@ def _first_nonfinite_index(tensor: torch.Tensor) -> tuple[int, ...] | None:
 
 
 @torch.no_grad()
-def _evaluate_accuracy(model, loader: DataLoader, device: torch.device) -> float:
+def _evaluate_accuracy(
+    model,
+    dataset: TensorDataset,
+    *,
+    batch_size: int,
+    device: torch.device,
+) -> float:
     model.eval()
     correct = 0
     total = 0
     use_amp = device.type == "cuda"
-    for x, lengths, labels in loader:
-        x = x.to(device=device, non_blocking=True)
-        lengths = lengths.to(device=device, non_blocking=True)
-        labels = labels.to(device=device, non_blocking=True)
+    for x, lengths, labels in _iter_tensor_batches(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        generator=None,
+        device=device,
+        repeat=False,
+    ):
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             logits = model(x, lengths)
         predictions = logits.argmax(dim=1)
@@ -249,40 +325,27 @@ def train_torch_model(
     if hasattr(dataset.train, "tensors") and len(dataset.train.tensors) > 0:
         dataset_is_on_gpu = dataset.train.tensors[0].is_cuda
 
-    pin_memory = device.type == "cuda" and not dataset_is_on_gpu
+    if device.type == "cuda" and not dataset_is_on_gpu:
+        dataset.train = _pin_tensor_dataset(dataset.train)
+        dataset.val = _pin_tensor_dataset(dataset.val)
+        dataset.test = _pin_tensor_dataset(dataset.test)
+
     train_generator = torch.Generator()
     train_generator.manual_seed(shuffle_seed)
     use_amp = mixed_precision and device.type == "cuda"
 
-    train_loader = _make_loader(
+    train_batches = _iter_tensor_batches(
         dataset.train,
         batch_size=batch_size,
         shuffle=True,
         drop_last=True,
         generator=train_generator,
-        pin_memory=pin_memory,
-        num_workers=dataloader_workers,
-    )
-    val_loader = _make_loader(
-        dataset.val,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        pin_memory=pin_memory,
-        num_workers=0,
-    )
-    test_loader = _make_loader(
-        dataset.test,
-        batch_size=batch_size,
-        shuffle=False,
-        drop_last=False,
-        pin_memory=pin_memory,
-        num_workers=0,
+        device=device,
+        repeat=True,
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr_scheduler(lr))
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    train_batches = _infinite_batches(train_loader)
 
     running_loss = 0.0
     all_train_metric: list[float] = []
@@ -298,9 +361,6 @@ def train_torch_model(
         for step in range(num_steps):
             model.train()
             x, lengths, labels = next(train_batches)
-            x = x.to(device=device, non_blocking=True)
-            lengths = lengths.to(device=device, non_blocking=True)
-            labels = labels.to(device=device, non_blocking=True)
 
             bad_input = _first_nonfinite_index(x)
             if bad_input is not None:
@@ -351,7 +411,12 @@ def train_torch_model(
             if (step + 1) % print_steps != 0:
                 continue
 
-            val_metric = _evaluate_accuracy(model, val_loader, device)
+            val_metric = _evaluate_accuracy(
+                model,
+                dataset.val,
+                batch_size=batch_size,
+                device=device,
+            )
             total_time = time.time() - start
             if verbose:
                 print(
@@ -378,7 +443,6 @@ def train_torch_model(
                 best_state_dict = {
                     key: value.detach().cpu().clone() for key, value in model.state_dict().items()
                 }
-
             running_loss = 0.0
             _save_metrics(
                 output_dir,
@@ -392,7 +456,12 @@ def train_torch_model(
 
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
-        best_test_metric = _evaluate_accuracy(model, test_loader, device)
+        best_test_metric = _evaluate_accuracy(
+            model,
+            dataset.test,
+            batch_size=batch_size,
+            device=device,
+        )
         if verbose:
             print(f"Test metric: {best_test_metric}")
         _save_metrics(
@@ -405,17 +474,7 @@ def train_torch_model(
         )
         return model
     finally:
-        _close_iterator(train_batches)
         del train_batches
-        
-        # Explicitly shutdown DataLoader workers to prevent file descriptor leaks
-        if hasattr(train_loader, "_iterator") and train_loader._iterator is not None:
-            if hasattr(train_loader._iterator, "_shutdown_workers"):
-                train_loader._iterator._shutdown_workers()
-                
-        del train_loader
-        del val_loader
-        del test_loader
         del optimizer
         del scaler
 

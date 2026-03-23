@@ -64,10 +64,11 @@ def _split_cache_token(value) -> str:
     return "_".join(str(int(v)) for v in values.tolist())
 
 
-def _split_cache_path(base_dir: str, cache_key) -> str:
+def _split_cache_path(base_dir: str, cache_key, *, include_time: bool) -> str:
     cache_dir = os.path.join(base_dir, "_split_cache")
     os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, f"v1_{_split_cache_token(cache_key)}.npz")
+    time_flag = "time1" if include_time else "time0"
+    return os.path.join(cache_dir, f"v2_{time_flag}_{_split_cache_token(cache_key)}.npz")
 
 
 def _load_cached_random_split(cache_path: str):
@@ -226,7 +227,7 @@ def _load_random_split_uea_dataset(
     int,
 ]:
     base = os.path.join(data_dir, "processed", "UEA", name)
-    split_cache_path = _split_cache_path(base, key)
+    split_cache_path = _split_cache_path(base, key, include_time=include_time)
     cached_split = _load_cached_random_split(split_cache_path)
 
     if cached_split is None:
@@ -255,12 +256,11 @@ def _load_random_split_uea_dataset(
             labels[val_idx],
             labels[test_idx],
         )
+        if include_time:
+            split_data = tuple(_prepend_time_channel(data, T) for data in split_data)
         _save_cached_random_split(split_cache_path, split_data, split_labels, label_dim)
     else:
         split_data, split_labels, label_dim = cached_split
-
-    if include_time:
-        split_data = tuple(_prepend_time_channel(data, T) for data in split_data)
 
     return split_data, split_labels, label_dim
 
