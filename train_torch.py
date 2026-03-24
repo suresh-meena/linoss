@@ -64,6 +64,30 @@ def _create_run_logger(output_dir: str, *, verbose: bool) -> _RunLogger:
     return logger
 
 
+def _configure_cuda_training_runtime(
+    *,
+    allow_tf32: bool = False,
+    logger: _RunLogger | None = None,
+) -> None:
+    if not torch.cuda.is_available():
+        return
+
+    if allow_tf32:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if logger is not None:
+            logger.log("Enabled CUDA TF32 matmul/cudnn execution for faster float32 training.")
+        return
+
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
+    if logger is not None:
+        logger.log("Using strict FP32 matmul/cudnn execution (TF32 disabled).")
+
+
 def _key_to_seed(key) -> int:
     values = np.asarray(key, dtype=np.uint32)
     if values.size < 2:
@@ -648,7 +672,9 @@ def create_dataset_model_and_train_torch(
     dataloader_workers: int | None = None,
     overwrite_output_dir: bool = False,
     auto_confirm_output_dir: bool = False,
+    allow_tf32: bool = False,
     mixed_precision: bool = False,
+    check_numerics: bool = True,
     torch_compile: bool = False,
     torch_compile_mode: str = "reduce-overhead",
     verbose: bool = True,
@@ -699,7 +725,9 @@ def create_dataset_model_and_train_torch(
             "Run configuration: "
             f"seed={seed}, dataset={dataset_name}, include_time={include_time}, "
             f"T={T}, num_steps={num_steps}, print_steps={print_steps}, "
-            f"batch_size={batch_size}, mixed_precision={mixed_precision}, "
+            f"batch_size={batch_size}, allow_tf32={allow_tf32}, "
+            f"mixed_precision={mixed_precision}, "
+            f"check_numerics={check_numerics}, "
             f"torch_compile={torch_compile}, model_args={model_args}"
         )
         logger.log(f"Creating dataset {dataset_name}")
@@ -717,6 +745,7 @@ def create_dataset_model_and_train_torch(
         )
 
         logger.log(f"Creating model {model_name}")
+        _configure_cuda_training_runtime(allow_tf32=allow_tf32, logger=logger)
         _set_torch_seed(modelkey)
         model = create_torch_model(
             model_name,
@@ -745,6 +774,7 @@ def create_dataset_model_and_train_torch(
             verbose=verbose,
             progress_callback=progress_callback,
             logger=logger,
+            check_numerics=check_numerics,
         )
     except Exception:
         logger.exception("Training setup or execution failed.")

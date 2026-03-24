@@ -163,6 +163,9 @@ def _build_run_args(
     if model_name in TORCH_MODELS:
         run_args["torch_compile"] = _parse_bool(config.get("torch_compile", False))
         run_args["torch_compile_mode"] = config.get("torch_compile_mode", "reduce-overhead")
+        run_args["allow_tf32"] = _parse_bool(config.get("allow_tf32", False))
+        run_args["mixed_precision"] = _parse_bool(config.get("mixed_precision", False))
+        run_args["check_numerics"] = _parse_bool(config.get("check_numerics", True))
         dataloader_workers = config.get("dataloader_workers", 0)
         run_args["dataloader_workers"] = int(dataloader_workers)
     return run_args, run_fn

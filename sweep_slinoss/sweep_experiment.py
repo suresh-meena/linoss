@@ -51,12 +51,18 @@ def _clear_retryable_failure_marker(target_dir: str) -> None:
     if os.path.exists(failure_marker):
         os.remove(failure_marker)
 
+
+def _has_failure_marker(target_dir: str) -> bool:
+    return os.path.exists(_failure_marker_path(target_dir))
+
+
 def get_pending_task_groups(
     experiment_folder: str,
     datasets: list[str],
     seeds_per_config: int | None,
     seeds: list[int] | None,
     skip_existing: bool,
+    retry_failed: bool,
 ) -> list[TaskGroup]:
     combinations = _iter_grid(HYPERPARAM_GRID)
     groups = defaultdict(list)
@@ -103,9 +109,11 @@ def get_pending_task_groups(
                     if _is_completed_run(target_dir):
                         continue
 
-                # Failed runs should be retried, not treated as completed.
-                # Remove the stale marker so this iteration starts from a clean state.
-                if os.path.exists(failure_marker):
+                # Failed runs are skipped by default so a bad config does not
+                # get retried forever. Opt in to retries explicitly.
+                if _has_failure_marker(target_dir) and not retry_failed:
+                    continue
+                if retry_failed and os.path.exists(failure_marker):
                     _clear_retryable_failure_marker(target_dir)
 
                 key = (dataset_name, params["include_time"], seed)
@@ -283,6 +291,7 @@ def run_concurrent_sweep(
     seeds_per_config: int | None,
     seeds: list[int] | None,
     skip_existing: bool,
+    retry_failed: bool,
     gpu_ids: list[int],
     show_progress: bool,
 ):
@@ -293,7 +302,7 @@ def run_concurrent_sweep(
     
     while True:
         pending_groups = get_pending_task_groups(
-            experiment_folder, datasets, seeds_per_config, seeds, skip_existing
+            experiment_folder, datasets, seeds_per_config, seeds, skip_existing, retry_failed
         )
         
         if not pending_groups:
@@ -392,6 +401,12 @@ if __name__ == "__main__":
         help="Skip runs whose output directory already exists.",
     )
     parser.add_argument(
+        "--retry_failed",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Retry runs with an existing _sweep_failed.json marker.",
+    )
+    parser.add_argument(
         "--gpu_ids",
         nargs="+",
         type=int,
@@ -423,6 +438,7 @@ if __name__ == "__main__":
         seeds_per_config=args.seeds_per_config,
         seeds=user_seeds,
         skip_existing=args.skip_existing,
+        retry_failed=args.retry_failed,
         gpu_ids=args.gpu_ids,
         show_progress=args.show_progress,
     )

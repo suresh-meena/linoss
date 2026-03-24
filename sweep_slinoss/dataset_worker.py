@@ -21,7 +21,13 @@ import torch
 from torch.utils.data import TensorDataset
 from data_dir.torch_datasets import create_torch_dataset
 from models.generate_torch_model import create_torch_model
-from train_torch import _create_run_logger, _prepare_output_dir, train_torch_model, _set_torch_seed
+from train_torch import (
+    _configure_cuda_training_runtime,
+    _create_run_logger,
+    _prepare_output_dir,
+    train_torch_model,
+    _set_torch_seed,
+)
 from models.SLinOSS import ensure_slinoss_cuda_ready
 from run_experiment import _build_run_args
 from sweep_slinoss.sweep_slinoss import (
@@ -184,9 +190,17 @@ def run_task_group(
                     "Run configuration: "
                     f"dataset={dataset_name}, seed={seed}, include_time={include_time}, "
                     f"batch_size={run_args['batch_size']}, num_steps={run_args['num_steps']}, "
-                    f"print_steps={run_args['print_steps']}, model_args={run_args['model_args']}"
+                    f"print_steps={run_args['print_steps']}, "
+                    f"allow_tf32={run_args.get('allow_tf32', False)}, "
+                    f"mixed_precision={run_args.get('mixed_precision', False)}, "
+                    f"check_numerics={run_args.get('check_numerics', True)}, "
+                    f"model_args={run_args['model_args']}"
                 )
 
+                _configure_cuda_training_runtime(
+                    allow_tf32=run_args.get("allow_tf32", False),
+                    logger=run_logger,
+                )
                 _set_torch_seed(modelkey)
 
                 model = create_torch_model(
@@ -215,11 +229,11 @@ def run_task_group(
                     output_dir=target_dir,
                     device=device,
                     dataloader_workers=0,
-                    mixed_precision=False,
+                    mixed_precision=run_args.get("mixed_precision", False),
                     verbose=True,
                     progress_callback=None,
                     logger=run_logger,
-                    check_numerics=False,
+                    check_numerics=run_args.get("check_numerics", True),
                 )
             scan_status = "cute_ok"
             if used_reference_fallback:
