@@ -28,7 +28,7 @@ except ImportError:
 HYPERPARAM_GRID = {
     "learning_rate": [1e-3, 1e-4, 1e-5],
     "hidden_dimension": [16, 64, 128],
-    "ssm_dimension": [16, 64],  #remmoved 256 
+    "ssm_dimension": [16, 64], 
     "num_ssm_blocks": [2, 4, 6],
     "include_time": [True, False],
 }
@@ -240,14 +240,6 @@ def _validate_slinoss_sweep_params(params: dict[str, object]) -> None:
             f"Expected d_model to be divisible by d_head. Got d_model={d_model}, d_head={d_head}."
         )
 
-    # The SLinOSS CUDA DU kernel has specific shape constraints.
-    # It requires D_padded >= P_padded (d_head >= d_state).
-    if d_head < d_state:
-        raise PreflightValidationError(
-            "Skipping known-unsupported SLinOSS CUDA kernel shape: d_head < d_state "
-            f"(d_model={d_model}, d_head={d_head}, d_state={d_state})."
-        )
-        
     # This regime has repeatedly failed inside the published SLinOSS CUDA DU kernel
     # with a D_padded/P_padded shape assertion. Skip it before launching work.
     if d_head > 2 * d_state:
