@@ -39,6 +39,7 @@ try:
 except ImportError:
     tqdm = None
 
+
 class TaskGroup(NamedTuple):
     dataset: str
     include_time: bool
@@ -123,6 +124,14 @@ def _log_file_path(experiment_folder: str, gpu_id: int, group: TaskGroup) -> str
     log_dir = os.path.join(experiment_folder, "logs")
     os.makedirs(log_dir, exist_ok=True)
     return os.path.join(log_dir, f"worker_gpu{gpu_id}_{group.dataset}_seed{group.seed}.log")
+
+
+def _write_json(path: str, payload: dict[str, object]) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, sort_keys=True)
 
 
 def _start_persistent_worker(gpu_id: int) -> subprocess.Popen:
@@ -221,6 +230,7 @@ def _gpu_worker_loop(
     group_queue: queue.Queue,
     experiment_folder: str,
     skip_existing: bool,
+    result_queue: queue.Queue | None = None,
 ) -> int:
     worker = _start_persistent_worker(gpu_id)
     completed_groups = 0
@@ -267,6 +277,12 @@ def _gpu_worker_loop(
                     pass
                 continue
 
+            if result_queue is not None:
+                records = response.get("records", [])
+                for record in records:
+                    record["worker_log_path"] = log_file
+                result_queue.put(records)
+
             if response.get("had_failures"):
                 print(
                     f"\n[GPU {gpu_id}] Group Finished with some failed runs: Dataset={group.dataset}, Seed={group.seed}. See log: {log_file}"
@@ -285,11 +301,13 @@ def run_concurrent_sweep(
     skip_existing: bool,
     gpu_ids: list[int],
     show_progress: bool,
+    report_path: str,
 ):
     print("Initializing multi-GPU grouped dataset execution...")
     
     total_processed = 0
     iteration = 1
+    all_records: list[dict[str, object]] = []
     
     while True:
         pending_groups = get_pending_task_groups(
@@ -305,16 +323,19 @@ def run_concurrent_sweep(
         print(f"Found {len(pending_groups)} task groups ({total_tasks_this_round} total tasks).")
 
         group_queue: queue.Queue = queue.Queue()
+        result_queue: queue.Queue = queue.Queue()
         for group in pending_groups:
             group_queue.put(group)
-
-        all_target_dirs = [task["target_dir"] for group in pending_groups for task in group.tasks]
-        last_completed = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(gpu_ids)) as executor:
             futures = [
                 executor.submit(
-                    _gpu_worker_loop, gpu_id, group_queue, experiment_folder, skip_existing
+                    _gpu_worker_loop,
+                    gpu_id,
+                    group_queue,
+                    experiment_folder,
+                    skip_existing,
+                    result_queue,
                 ) for gpu_id in gpu_ids
             ]
 
@@ -331,21 +352,30 @@ def run_concurrent_sweep(
             while True:
                 done_count = sum(1 for f in futures if f.done())
 
-                current_completed = 0
-                for target_dir in all_target_dirs:
-                    if _is_completed_run(target_dir) or os.path.exists(_failure_marker_path(target_dir)):
-                        current_completed += 1
-
-                if current_completed > last_completed:
-                    delta = current_completed - last_completed
+                while True:
+                    try:
+                        records = result_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    all_records.extend(records)
+                    delta = len(records)
                     total_processed += delta
-                    last_completed = current_completed
                     if show_progress and tqdm is not None:
                         pbar.update(delta)
 
                 if done_count == len(futures):
                     for future in futures:
                         future.result()
+                    while True:
+                        try:
+                            records = result_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        all_records.extend(records)
+                        delta = len(records)
+                        total_processed += delta
+                        if show_progress and tqdm is not None:
+                            pbar.update(delta)
                     break
 
                 time.sleep(2.0)
@@ -355,7 +385,33 @@ def run_concurrent_sweep(
                     
         iteration += 1
 
+    completed = sum(1 for record in all_records if record.get("status") == "completed")
+    failed = sum(1 for record in all_records if record.get("status") == "failed")
+    skipped = sum(1 for record in all_records if record.get("status") == "skipped_existing")
+    failure_breakdown: dict[str, int] = {}
+    for record in all_records:
+        failure_kind = record.get("failure_kind")
+        if failure_kind is None:
+            continue
+        name = str(failure_kind)
+        failure_breakdown[name] = failure_breakdown.get(name, 0) + 1
+
+    _write_json(
+        report_path,
+        {
+            "report_path": report_path,
+            "datasets": datasets,
+            "total_records": len(all_records),
+            "completed": completed,
+            "failed": failed,
+            "skipped_existing": skipped,
+            "failure_breakdown": failure_breakdown,
+            "records": all_records,
+        },
+    )
+
     print(f"\nSweep complete! Total configs processed across all iterations: {total_processed}")
+    print(f"JSON run report: {report_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -406,6 +462,12 @@ if __name__ == "__main__":
         help="Show tqdm progress bar when tqdm is installed.",
     )
     parser.add_argument(
+        "--report_path",
+        type=str,
+        default="outputs/SLinOSS/sweep_run_report.json",
+        help="Path to the aggregated JSON report for all sweep runs.",
+    )
+    parser.add_argument(
         "--dataloader_workers",
         type=int,
         default=0,
@@ -425,4 +487,5 @@ if __name__ == "__main__":
         skip_existing=args.skip_existing,
         gpu_ids=args.gpu_ids,
         show_progress=args.show_progress,
+        report_path=args.report_path,
     )

@@ -57,6 +57,14 @@ def _write_summary(path: str, summary: dict[str, object]) -> None:
         json.dump(summary, file, indent=2, sort_keys=True)
 
 
+def _write_json(path: str, payload: dict[str, object]) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2, sort_keys=True)
+
+
 class DryRunTaskGroup(NamedTuple):
     dataset: str
     include_time: bool
@@ -129,6 +137,7 @@ def _build_dry_run_task_groups(
     task_groups: list[DryRunTaskGroup] = []
     for (dataset_name, include_time, seed), tasks in groups.items():
         base_config = base_configs[dataset_name]
+        base_run_args, _ = _build_run_args("SLinOSS", dataset_name, base_config)
         gen = torch.Generator().manual_seed(seed)
         datasetkey = torch.randint(0, 2**32, (1,), generator=gen).item()
         model_seed = torch.randint(0, 2**32, (1,), generator=gen).item()
@@ -140,7 +149,7 @@ def _build_dry_run_task_groups(
                     include_time=include_time,
                     seed=seed,
                     data_dir=str(base_config["data_dir"]),
-                    use_presplit=bool(_build_run_args("SLinOSS", dataset_name, base_config)[0]["use_presplit"]),
+                    use_presplit=bool(base_run_args["use_presplit"]),
                     T=float(base_config["T"]),
                     batch_size=int(base_config["batch_size"]),
                     datasetkey=datasetkey,
@@ -242,6 +251,7 @@ def run_dry_run_grid(
     if os.path.exists(report_path):
         os.remove(report_path)
     summary_path = os.path.splitext(report_path)[0] + "_summary.json"
+    json_path = os.path.splitext(report_path)[0] + ".json"
 
     gpu_queue = queue.Queue()
     for gid in gpu_ids:
@@ -250,6 +260,7 @@ def run_dry_run_grid(
     passed = 0
     failed = 0
     failure_breakdown: dict[str, int] = {}
+    all_records: list[dict[str, object]] = []
 
     progress = None
     if show_progress and tqdm is not None:
@@ -287,6 +298,7 @@ def run_dry_run_grid(
                         )
 
                 _write_jsonl(report_path, record)
+                all_records.append(record)
                 if progress is not None:
                     progress.update(1)
 
@@ -303,12 +315,27 @@ def run_dry_run_grid(
         "failure_breakdown": failure_breakdown,
     }
     _write_summary(summary_path, summary)
+    _write_json(
+        json_path,
+        {
+            "report_path": report_path,
+            "json_path": json_path,
+            "summary_path": summary_path,
+            "datasets": datasets,
+            "total_runs": total_runs,
+            "passed": passed,
+            "failed": failed,
+            "failure_breakdown": failure_breakdown,
+            "records": all_records,
+        },
+    )
 
     print(
         f"\nDry-run summary: passed={passed}, failed={failed}, total_runs={total_runs}, "
         f"failure_breakdown={failure_breakdown or 'none'}"
     )
     print(f"Detailed report: {report_path}")
+    print(f"JSON run report: {json_path}")
     print(f"Summary report: {summary_path}")
 
 

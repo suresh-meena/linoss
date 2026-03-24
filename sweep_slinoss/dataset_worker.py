@@ -5,6 +5,7 @@ import contextlib
 import json
 import os
 import sys
+import time
 import traceback
 from typing import Callable
 
@@ -139,6 +140,7 @@ def run_task_group(
     logger(f"[Worker] Dataset loaded. Starting {len(tasks)} runs...")
 
     had_failures = False
+    records: list[dict[str, object]] = []
 
     for i, task in enumerate(tasks):
         params = task["params"]
@@ -148,22 +150,39 @@ def run_task_group(
         matching_lines: list[str] = []
         scan_status = "unknown_due_to_failure"
         used_reference_fallback = False
-
-        if skip_existing and _is_completed_run(target_dir):
-            continue
+        started_at = time.time()
+        run_status = "failed"
+        failure_kind = None
+        error_type = None
+        error_message = None
 
         run_config = _apply_sweep_params_to_config(base_config, params)
         run_args, _ = _build_run_args("SLinOSS", dataset_name, run_config)
         run_args["print_steps"] = max(int(run_args["print_steps"]), 1000)
 
+        if skip_existing and _is_completed_run(target_dir):
+            records.append(
+                {
+                    "dataset_name": dataset_name,
+                    "include_time": bool(include_time),
+                    "seed": int(seed),
+                    "status": "skipped_existing",
+                    "params": params,
+                    "target_dir": target_dir,
+                    "training_log_path": os.path.join(target_dir, "training.log"),
+                    "model_args": run_args["model_args"],
+                    "scan_status": "skipped_existing",
+                    "used_reference_fallback": False,
+                    "matching_lines": [],
+                    "elapsed_sec": round(time.time() - started_at, 4),
+                }
+            )
+            continue
+
         overwrite_existing = os.path.isdir(target_dir) and not skip_existing
 
         logger(f"[Worker] Run {i+1}/{len(tasks)}: {os.path.basename(target_dir)}")
-        
-        os.makedirs(target_dir, exist_ok=True)
         active_marker = os.path.join(target_dir, "_active_run.json")
-        with open(active_marker, "w") as f:
-            json.dump({"status": "running"}, f)
 
         run_logger = None
         try:
@@ -237,6 +256,7 @@ def run_task_group(
                 seed=seed,
                 run_args=run_args,
             )
+            run_status = "completed"
 
             del model
             del trained_model
@@ -245,6 +265,8 @@ def run_task_group(
             if os.path.exists(active_marker):
                 os.remove(active_marker)
             failure_kind = _classify_failure(exc)
+            error_type = exc.__class__.__name__
+            error_message = str(exc)
             _cleanup_after_failure(target_dir)
             _write_failure_marker(
                 target_dir,
@@ -281,9 +303,30 @@ def run_task_group(
                 matching_lines=matching_lines,
                 status=scan_status,
             )
+            record = {
+                "dataset_name": dataset_name,
+                "include_time": bool(include_time),
+                "seed": int(seed),
+                "status": run_status,
+                "params": params,
+                "target_dir": target_dir,
+                "training_log_path": os.path.join(target_dir, "training.log"),
+                "model_args": run_args["model_args"],
+                "scan_status": scan_status,
+                "used_reference_fallback": used_reference_fallback,
+                "matching_lines": matching_lines,
+                "elapsed_sec": round(time.time() - started_at, 4),
+            }
+            if failure_kind is not None:
+                record["failure_kind"] = failure_kind
+            if error_type is not None:
+                record["error_type"] = error_type
+            if error_message is not None:
+                record["error_message"] = error_message
+            records.append(record)
             _cleanup_after_run()
 
-    return {"tasks": len(tasks), "had_failures": had_failures}
+    return {"tasks": len(tasks), "had_failures": had_failures, "records": records}
 
 def main():
     parser = argparse.ArgumentParser()

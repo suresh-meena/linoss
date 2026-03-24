@@ -75,6 +75,15 @@ def _require_cuda_tensor(name: str, tensor: torch.Tensor) -> None:
         )
 
 
+def _normalize_backend_name(backend: str) -> str:
+    name = str(backend).strip().lower()
+    if name != "cute":
+        raise ValueError(
+            f"Unsupported SLinOSS backend {backend!r}. Only 'cute' is supported."
+        )
+    return name
+
+
 class TokenBatchNormEMA(nn.Module):
     """Apply BatchNorm1d to ``(batch, time, channels)`` tensors without transposes."""
 
@@ -154,6 +163,7 @@ class SLinOSSBlock(nn.Module):
         d_model: int,
         *,
         d_state: int,
+        backend: str = "cute",
         expand: int,
         d_head: int,
         d_conv: int,
@@ -180,6 +190,7 @@ class SLinOSSBlock(nn.Module):
                 "SLinOSS uses the CUDA causal-conv kernel exclusively, which "
                 f"currently supports d_conv in {{2, 3, 4}}. Got d_conv={d_conv}."
             )
+        _normalize_backend_name(backend)
 
         self.norm = TokenBatchNormEMA(d_model)
         self.mixer = SLinOSSMixer(
@@ -232,6 +243,7 @@ class SLinOSSClassifier(nn.Module):
         d_model: int,
         n_layers: int,
         d_state: int = 128,
+        backend: str = "cute",
         expand: int = 2,
         d_head: int = 64,
         d_conv: int = 4,
@@ -249,6 +261,7 @@ class SLinOSSClassifier(nn.Module):
     ) -> None:
         super().__init__()
         ensure_slinoss_cuda_ready()
+        backend = _normalize_backend_name(backend)
 
         self.input_proj = nn.Linear(input_dim, d_model)
         self.blocks = nn.ModuleList(
@@ -256,6 +269,7 @@ class SLinOSSClassifier(nn.Module):
                 SLinOSSBlock(
                     d_model=d_model,
                     d_state=d_state,
+                    backend=backend,
                     expand=expand,
                     d_head=d_head,
                     d_conv=d_conv,

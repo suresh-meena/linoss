@@ -19,6 +19,11 @@ from torch.utils.data import DataLoader
 # Prevent file descriptor leaks in sweeps
 torch.multiprocessing.set_sharing_strategy("file_system")
 
+# Enable TF32-backed float32 matmul paths on supported NVIDIA GPUs for faster
+# training/inference, matching PyTorch's runtime guidance.
+if hasattr(torch, "set_float32_matmul_precision"):
+    torch.set_float32_matmul_precision("high")
+
 from data_dir.torch_datasets import TorchDataset, create_torch_dataset
 from models.generate_torch_model import create_torch_model
 
@@ -130,6 +135,7 @@ def _build_output_dir(
             "d_model": "dM",
             "n_layers": "nL",
             "d_state": "dS",
+            "backend": "be",
             "expand": "x",
             "d_head": "dH",
             "d_conv": "dC",
@@ -154,6 +160,8 @@ def _build_output_dir(
 
     params = []
     for key, value in model_args.items():
+        if key == "backend" and str(value).strip().lower() == "cute":
+            continue
         name = _format_value(value)
         if "(" in name:
             name = name.split("(", 1)[0]

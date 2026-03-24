@@ -93,6 +93,7 @@ def _build_slinoss_model_args(config: dict) -> tuple[dict, int, int, None]:
     d_model = int(_first_present(config, ("d_model", "hidden_dim")))
     n_layers = int(_first_present(config, ("n_layers", "num_blocks")))
     d_state = int(_first_present(config, ("d_state", "ssm_dim"), default=128))
+    backend = str(config.get("backend", "cute")).strip().lower()
     expand = int(config.get("expand", 2))
     d_head = int(config.get("d_head", d_model))
     d_conv = int(config.get("d_conv", 4))
@@ -104,6 +105,7 @@ def _build_slinoss_model_args(config: dict) -> tuple[dict, int, int, None]:
         "d_model": d_model,
         "n_layers": n_layers,
         "d_state": d_state,
+        "backend": backend,
         "expand": expand,
         "d_head": d_head,
         "d_conv": d_conv,
