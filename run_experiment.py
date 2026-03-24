@@ -163,9 +163,29 @@ def _build_run_args(
     if model_name in TORCH_MODELS:
         run_args["torch_compile"] = _parse_bool(config.get("torch_compile", False))
         run_args["torch_compile_mode"] = config.get("torch_compile_mode", "reduce-overhead")
+        run_args["torch_compile_dynamic"] = _parse_bool(
+            config.get("torch_compile_dynamic", False)
+        )
         run_args["allow_tf32"] = _parse_bool(config.get("allow_tf32", False))
         run_args["mixed_precision"] = _parse_bool(config.get("mixed_precision", False))
         run_args["check_numerics"] = _parse_bool(config.get("check_numerics", True))
+        run_args["weight_decay"] = float(config.get("weight_decay", 0.0))
+        grad_clip_norm = config.get("grad_clip_norm", 1.0)
+        run_args["grad_clip_norm"] = (
+            None if grad_clip_norm is None else float(grad_clip_norm)
+        )
+        early_stopping_patience = config.get("early_stopping_patience", 10)
+        run_args["early_stopping_patience"] = (
+            None
+            if early_stopping_patience is None
+            else int(early_stopping_patience)
+        )
+        min_steps_before_early_stop = config.get("min_steps_before_early_stop")
+        run_args["min_steps_before_early_stop"] = (
+            None
+            if min_steps_before_early_stop is None
+            else int(min_steps_before_early_stop)
+        )
         dataloader_workers = config.get("dataloader_workers", 0)
         run_args["dataloader_workers"] = int(dataloader_workers)
     return run_args, run_fn

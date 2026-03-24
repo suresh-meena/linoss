@@ -55,6 +55,24 @@ class _RunLogger:
             self._handle.close()
 
 
+@dataclass(frozen=True)
+class TorchTrainingSummary:
+    output_dir: str
+    completed_steps: int
+    best_validation_metric: float
+    test_metric: float
+    train_loss_history: tuple[float, ...]
+    validation_metric_history: tuple[float, ...]
+    elapsed_time_history: tuple[float, ...]
+
+
+@dataclass(frozen=True)
+class SLinOSSRunResult:
+    model: torch.nn.Module
+    output_dir: str
+    summary: TorchTrainingSummary
+
+
 def _create_run_logger(output_dir: str, *, verbose: bool) -> _RunLogger:
     os.makedirs(output_dir, exist_ok=True)
     log_path = os.path.join(output_dir, "training.log")
@@ -103,6 +121,7 @@ def _prepare_output_dir(
     *,
     overwrite: bool = False,
     auto_confirm: bool = False,
+    prompt_if_exists: bool = True,
     verbose: bool = True,
 ) -> None:
     if os.path.isdir(output_dir):
@@ -113,17 +132,23 @@ def _prepare_output_dir(
                 print(f"Directory {output_dir} has been deleted and recreated.", flush=True)
             return
 
-        user_input = input(
-            f"Warning: Output directory {output_dir} already exists. "
-            "Do you want to delete it? (yes/no): "
+        if prompt_if_exists:
+            user_input = input(
+                f"Warning: Output directory {output_dir} already exists. "
+                "Do you want to delete it? (yes/no): "
+            )
+            if user_input.lower() == "yes":
+                shutil.rmtree(output_dir)
+                os.makedirs(output_dir)
+                if verbose:
+                    print(f"Directory {output_dir} has been deleted and recreated.", flush=True)
+                return
+            raise ValueError(f"Directory {output_dir} already exists. Exiting.")
+
+        raise FileExistsError(
+            f"Output directory {output_dir} already exists. "
+            "Pass overwrite_output_dir=True to replace it."
         )
-        if user_input.lower() == "yes":
-            shutil.rmtree(output_dir)
-            os.makedirs(output_dir)
-            if verbose:
-                print(f"Directory {output_dir} has been deleted and recreated.", flush=True)
-            return
-        raise ValueError(f"Directory {output_dir} already exists. Exiting.")
 
     os.makedirs(output_dir)
     if verbose:
@@ -192,6 +217,37 @@ def _build_output_dir(
         return f"{'_'.join(compact_prefix)}_{digest}"
 
     return full_name
+
+
+def build_slinoss_output_dir(
+    *,
+    seed: int,
+    dataset_name: str,
+    output_parent_dir: str,
+    T: float,
+    include_time: bool,
+    num_steps: int,
+    lr: float,
+    model_args: dict,
+) -> str:
+    run_dir_name = _build_output_dir(
+        seed=seed,
+        T=T,
+        include_time=include_time,
+        num_steps=num_steps,
+        lr=lr,
+        model_name="SLinOSS",
+        stepsize=1,
+        logsig_depth=1,
+        model_args=model_args,
+    )
+    return os.path.join(
+        output_parent_dir,
+        "outputs",
+        "SLinOSS",
+        dataset_name,
+        run_dir_name,
+    )
 
 
 def _make_loader(
@@ -307,11 +363,17 @@ def _first_nonfinite_index(tensor: torch.Tensor) -> tuple[int, ...] | None:
 
 
 @torch.no_grad()
-def _evaluate_accuracy(model, batches, device: torch.device) -> float:
+def _evaluate_accuracy(
+    model,
+    batches,
+    device: torch.device,
+    *,
+    mixed_precision: bool = False,
+) -> float:
     model.eval()
     correct = torch.zeros((), device=device, dtype=torch.int64)
     total = 0
-    use_amp = device.type == "cuda"
+    use_amp = mixed_precision and device.type == "cuda"
     for x, lengths, labels in batches:
         if x.device != device:
             x = x.to(device=device, non_blocking=True)
@@ -329,15 +391,27 @@ def _evaluate_accuracy(model, batches, device: torch.device) -> float:
     return float(correct.float().div(total).item())
 
 
-def _make_optimizer(model, *, lr: float, device: torch.device, logger: _RunLogger):
+def _make_optimizer(
+    model,
+    *,
+    lr: float,
+    weight_decay: float,
+    device: torch.device,
+    logger: _RunLogger,
+):
     if device.type == "cuda":
         try:
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True)
+            optimizer = torch.optim.Adam(
+                model.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+                fused=True,
+            )
             logger.log("Using fused Adam optimizer.")
             return optimizer
         except (TypeError, RuntimeError):
             logger.log("Fused Adam unavailable; falling back to standard Adam.")
-    return torch.optim.Adam(model.parameters(), lr=lr)
+    return torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 
 def _save_metrics(
@@ -348,7 +422,7 @@ def _save_metrics(
     all_time: list[float],
     test_metric: float,
 ) -> None:
-    steps = np.arange(0, len(all_train_metric) * print_steps, print_steps)
+    steps = np.arange(print_steps, (len(all_train_metric) + 1) * print_steps, print_steps)
     np.save(os.path.join(output_dir, "steps.npy"), steps)
     np.save(
         os.path.join(output_dir, "all_train_metric.npy"),
@@ -368,6 +442,26 @@ def _set_torch_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+def load_torch_training_summary(output_dir: str) -> TorchTrainingSummary:
+    steps = np.load(os.path.join(output_dir, "steps.npy"))
+    train_loss = np.load(os.path.join(output_dir, "all_train_metric.npy"))
+    validation = np.load(os.path.join(output_dir, "all_val_metric.npy"))
+    elapsed = np.load(os.path.join(output_dir, "all_time.npy"))
+    test_metric = np.load(os.path.join(output_dir, "test_metric.npy"))
+
+    completed_steps = int(steps[-1]) if steps.size else 0
+    best_validation_metric = float(np.max(validation)) if validation.size else float("-inf")
+    return TorchTrainingSummary(
+        output_dir=output_dir,
+        completed_steps=completed_steps,
+        best_validation_metric=best_validation_metric,
+        test_metric=float(np.asarray(test_metric).item()),
+        train_loss_history=tuple(float(x) for x in np.asarray(train_loss).tolist()),
+        validation_metric_history=tuple(float(x) for x in np.asarray(validation).tolist()),
+        elapsed_time_history=tuple(float(x) for x in np.asarray(elapsed).tolist()),
+    )
+
+
 def train_torch_model(
     dataset: TorchDataset,
     model,
@@ -381,6 +475,10 @@ def train_torch_model(
     output_dir: str,
     device: torch.device,
     dataloader_workers: int | None = None,
+    weight_decay: float = 0.0,
+    grad_clip_norm: float | None = 1.0,
+    early_stopping_patience: int | None = 10,
+    min_steps_before_early_stop: int | None = None,
     mixed_precision: bool = False,
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
@@ -410,6 +508,32 @@ def train_torch_model(
         raise ValueError(
             f"dataloader_workers must be >= 0 when provided. Got {dataloader_workers}."
         )
+    if weight_decay < 0:
+        logger.log(f"Invalid weight_decay value {weight_decay}; expected >= 0.")
+        if owns_logger:
+            logger.close()
+        raise ValueError("weight_decay must be >= 0.")
+    if grad_clip_norm is not None and grad_clip_norm <= 0:
+        logger.log(f"Invalid grad_clip_norm value {grad_clip_norm}; expected > 0 or None.")
+        if owns_logger:
+            logger.close()
+        raise ValueError("grad_clip_norm must be > 0 when provided.")
+    if early_stopping_patience is not None and early_stopping_patience < 0:
+        logger.log(
+            "Invalid early_stopping_patience value "
+            f"{early_stopping_patience}; expected >= 0 or None."
+        )
+        if owns_logger:
+            logger.close()
+        raise ValueError("early_stopping_patience must be >= 0 when provided.")
+    if min_steps_before_early_stop is not None and min_steps_before_early_stop < 0:
+        logger.log(
+            "Invalid min_steps_before_early_stop value "
+            f"{min_steps_before_early_stop}; expected >= 0 or None."
+        )
+        if owns_logger:
+            logger.close()
+        raise ValueError("min_steps_before_early_stop must be >= 0 when provided.")
 
     dataset_is_on_gpu = False
     if hasattr(dataset.train, "tensors") and len(dataset.train.tensors) > 0:
@@ -426,11 +550,15 @@ def train_torch_model(
     use_amp = mixed_precision and device.type == "cuda"
     effective_lr = lr_scheduler(lr)
     use_tensor_batching = dataset_is_on_gpu
+    early_stop_after = print_steps if min_steps_before_early_stop is None else min_steps_before_early_stop
 
     logger.log(
         "Starting training run: "
         f"output_dir={output_dir}, device={device}, batch_size={batch_size}, "
         f"num_steps={num_steps}, print_steps={print_steps}, lr={effective_lr}, "
+        f"weight_decay={weight_decay}, grad_clip_norm={grad_clip_norm}, "
+        f"early_stopping_patience={early_stopping_patience}, "
+        f"min_steps_before_early_stop={early_stop_after}, "
         f"mixed_precision={mixed_precision}, dataset_on_gpu={dataset_is_on_gpu}, "
         f"tensor_batching={use_tensor_batching}, check_numerics={check_numerics}"
     )
@@ -493,7 +621,13 @@ def train_torch_model(
         val_batches_factory = lambda: val_loader
         test_batches_factory = lambda: test_loader
 
-    optimizer = _make_optimizer(model, lr=effective_lr, device=device, logger=logger)
+    optimizer = _make_optimizer(
+        model,
+        lr=effective_lr,
+        weight_decay=weight_decay,
+        device=device,
+        logger=logger,
+    )
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     running_loss = torch.zeros((), device=device, dtype=torch.float32)
@@ -547,11 +681,23 @@ def train_torch_model(
             if use_amp:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if grad_clip_norm is not None:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        max_norm=grad_clip_norm,
+                    )
+                else:
+                    grad_norm = torch.zeros((), device=device, dtype=torch.float32)
             else:
                 loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            if check_numerics and not bool(torch.isfinite(grad_norm)):
+                if grad_clip_norm is not None:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        max_norm=grad_clip_norm,
+                    )
+                else:
+                    grad_norm = torch.zeros((), device=device, dtype=torch.float32)
+            if check_numerics and grad_clip_norm is not None and not bool(torch.isfinite(grad_norm)):
                 grad_norm_value = float(grad_norm.detach().item())
                 raise FloatingPointError(
                     "Encountered non-finite gradient norm "
@@ -568,7 +714,12 @@ def train_torch_model(
             if (step + 1) % print_steps != 0:
                 continue
 
-            val_metric = _evaluate_accuracy(model, val_batches_factory(), device)
+            val_metric = _evaluate_accuracy(
+                model,
+                val_batches_factory(),
+                device,
+                mixed_precision=mixed_precision,
+            )
             total_time = time.time() - start
             train_loss = float((running_loss / print_steps).item())
             logger.log(
@@ -584,10 +735,14 @@ def train_torch_model(
             if progress_callback is not None:
                 progress_callback(step + 1, num_steps)
 
-            if step > 0:
+            if (
+                early_stopping_patience is not None
+                and (step + 1) >= early_stop_after
+                and best_val_metric != float("-inf")
+            ):
                 if val_metric <= best_val_metric:
                     no_val_improvement += 1
-                    if no_val_improvement > 10:
+                    if no_val_improvement > early_stopping_patience:
                         logger.log(
                             "Early stopping triggered after "
                             f"{step + 1} steps due to no validation improvement."
@@ -616,7 +771,12 @@ def train_torch_model(
 
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
-        best_test_metric = _evaluate_accuracy(model, test_batches_factory(), device)
+        best_test_metric = _evaluate_accuracy(
+            model,
+            test_batches_factory(),
+            device,
+            mixed_precision=mixed_precision,
+        )
         logger.log(f"Test metric: {best_test_metric:.6f}")
         _save_metrics(
             output_dir,
@@ -675,8 +835,13 @@ def create_dataset_model_and_train_torch(
     allow_tf32: bool = False,
     mixed_precision: bool = False,
     check_numerics: bool = True,
+    weight_decay: float = 0.0,
+    grad_clip_norm: float | None = 1.0,
+    early_stopping_patience: int | None = 10,
+    min_steps_before_early_stop: int | None = None,
     torch_compile: bool = False,
     torch_compile_mode: str = "reduce-overhead",
+    torch_compile_dynamic: bool = False,
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
 ):
@@ -687,32 +852,95 @@ def create_dataset_model_and_train_torch(
     if metric != "accuracy":
         raise ValueError("SLinOSS Torch training currently supports accuracy only.")
 
+    full_output_dir = build_slinoss_output_dir(
+        seed=seed,
+        dataset_name=dataset_name,
+        output_parent_dir=output_parent_dir,
+        T=T,
+        include_time=include_time,
+        num_steps=num_steps,
+        lr=lr,
+        model_args=model_args,
+    )
+    result = run_slinoss_training(
+        seed=seed,
+        data_dir=data_dir,
+        use_presplit=use_presplit,
+        dataset_name=dataset_name,
+        include_time=include_time,
+        T=T,
+        model_args=model_args,
+        num_steps=num_steps,
+        print_steps=print_steps,
+        lr=lr,
+        lr_scheduler=lr_scheduler,
+        batch_size=batch_size,
+        output_dir=full_output_dir,
+        dataloader_workers=dataloader_workers,
+        overwrite_output_dir=overwrite_output_dir,
+        auto_confirm_output_dir=auto_confirm_output_dir,
+        allow_tf32=allow_tf32,
+        mixed_precision=mixed_precision,
+        check_numerics=check_numerics,
+        weight_decay=weight_decay,
+        grad_clip_norm=grad_clip_norm,
+        early_stopping_patience=early_stopping_patience,
+        min_steps_before_early_stop=min_steps_before_early_stop,
+        torch_compile=torch_compile,
+        torch_compile_mode=torch_compile_mode,
+        torch_compile_dynamic=torch_compile_dynamic,
+        verbose=verbose,
+        progress_callback=progress_callback,
+        prompt_if_output_dir_exists=True,
+    )
+    return result.model
+
+
+def run_slinoss_training(
+    *,
+    seed: int,
+    data_dir: str,
+    use_presplit: bool,
+    dataset_name: str,
+    include_time: bool,
+    T: float,
+    model_args: dict,
+    num_steps: int,
+    print_steps: int,
+    lr: float,
+    lr_scheduler,
+    batch_size: int,
+    output_dir: str,
+    dataloader_workers: int | None = None,
+    overwrite_output_dir: bool = False,
+    auto_confirm_output_dir: bool = False,
+    allow_tf32: bool = False,
+    mixed_precision: bool = False,
+    check_numerics: bool = True,
+    weight_decay: float = 0.0,
+    grad_clip_norm: float | None = 1.0,
+    early_stopping_patience: int | None = 10,
+    min_steps_before_early_stop: int | None = None,
+    torch_compile: bool = False,
+    torch_compile_mode: str = "reduce-overhead",
+    torch_compile_dynamic: bool = False,
+    verbose: bool = True,
+    progress_callback: Callable[[int, int], None] | None = None,
+    prompt_if_output_dir_exists: bool = False,
+) -> SLinOSSRunResult:
     from models.SLinOSS import ensure_slinoss_cuda_ready
 
     ensure_slinoss_cuda_ready()
     device = torch.device("cuda")
 
-    output_parent_dir = os.path.join(output_parent_dir, "outputs", model_name, dataset_name)
-    output_dir = _build_output_dir(
-        seed=seed,
-        T=T,
-        include_time=include_time,
-        num_steps=num_steps,
-        lr=lr,
-        model_name=model_name,
-        stepsize=1,
-        logsig_depth=1,
-        model_args=model_args,
-    )
-    full_output_dir = os.path.join(output_parent_dir, output_dir)
-
     _prepare_output_dir(
-        full_output_dir,
+        output_dir,
         overwrite=overwrite_output_dir,
         auto_confirm=auto_confirm_output_dir,
+        prompt_if_exists=prompt_if_output_dir_exists,
         verbose=verbose,
     )
-    logger = _create_run_logger(full_output_dir, verbose=verbose)
+    logger = _create_run_logger(output_dir, verbose=verbose)
 
     # Use native python/numpy/torch random to generate seeds instead of jax
     gen = torch.Generator().manual_seed(seed)
@@ -726,9 +954,12 @@ def create_dataset_model_and_train_torch(
             f"seed={seed}, dataset={dataset_name}, include_time={include_time}, "
             f"T={T}, num_steps={num_steps}, print_steps={print_steps}, "
             f"batch_size={batch_size}, allow_tf32={allow_tf32}, "
-            f"mixed_precision={mixed_precision}, "
-            f"check_numerics={check_numerics}, "
-            f"torch_compile={torch_compile}, model_args={model_args}"
+            f"mixed_precision={mixed_precision}, check_numerics={check_numerics}, "
+            f"weight_decay={weight_decay}, grad_clip_norm={grad_clip_norm}, "
+            f"early_stopping_patience={early_stopping_patience}, "
+            f"min_steps_before_early_stop={min_steps_before_early_stop}, "
+            f"torch_compile={torch_compile}, torch_compile_mode={torch_compile_mode}, "
+            f"torch_compile_dynamic={torch_compile_dynamic}, model_args={model_args}"
         )
         logger.log(f"Creating dataset {dataset_name}")
         dataset = create_torch_dataset(
@@ -744,21 +975,28 @@ def create_dataset_model_and_train_torch(
             f"train={len(dataset.train)}, val={len(dataset.val)}, test={len(dataset.test)}"
         )
 
-        logger.log(f"Creating model {model_name}")
+        logger.log("Creating model SLinOSS")
         _configure_cuda_training_runtime(allow_tf32=allow_tf32, logger=logger)
         _set_torch_seed(modelkey)
         model = create_torch_model(
-            model_name,
+            "SLinOSS",
             dataset.data_dim,
             dataset.label_dim,
             model_args=model_args,
         ).to(device)
 
         if torch_compile:
-            logger.log(f"Compiling model with mode={torch_compile_mode}")
-            model = torch.compile(model, mode=torch_compile_mode, dynamic=True)
+            logger.log(
+                "Compiling model with "
+                f"mode={torch_compile_mode}, dynamic={torch_compile_dynamic}"
+            )
+            model = torch.compile(
+                model,
+                mode=torch_compile_mode,
+                dynamic=torch_compile_dynamic,
+            )
 
-        return train_torch_model(
+        trained_model = train_torch_model(
             dataset,
             model,
             num_steps=num_steps,
@@ -767,14 +1005,30 @@ def create_dataset_model_and_train_torch(
             lr_scheduler=lr_scheduler,
             batch_size=batch_size,
             shuffle_seed=shufflekey,
-            output_dir=full_output_dir,
+            output_dir=output_dir,
             device=device,
             dataloader_workers=dataloader_workers,
+            weight_decay=weight_decay,
+            grad_clip_norm=grad_clip_norm,
+            early_stopping_patience=early_stopping_patience,
+            min_steps_before_early_stop=min_steps_before_early_stop,
             mixed_precision=mixed_precision,
             verbose=verbose,
             progress_callback=progress_callback,
             logger=logger,
             check_numerics=check_numerics,
+        )
+        summary = load_torch_training_summary(output_dir)
+        logger.log(
+            "Run finished: "
+            f"completed_steps={summary.completed_steps}, "
+            f"best_validation_metric={summary.best_validation_metric:.6f}, "
+            f"test_metric={summary.test_metric:.6f}"
+        )
+        return SLinOSSRunResult(
+            model=trained_model,
+            output_dir=output_dir,
+            summary=summary,
         )
     except Exception:
         logger.exception("Training setup or execution failed.")
