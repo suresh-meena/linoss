@@ -7,8 +7,7 @@ data_dir/raw/
 data_dir/processed/
 
 #results
-outputs/SLinOSS/
-outputs/smoke_timing/
+outputs/
 **/training.log
 experiment_configs/repeats/logs/
 
