@@ -290,13 +290,51 @@ def _first_nonfinite_index(tensor: torch.Tensor) -> tuple[int, ...] | None:
     return tuple(int(i) for i in bad[0].tolist())
 
 
+def _raise_on_nonfinite_tensor(name: str, tensor: torch.Tensor, *, context: str) -> None:
+    bad = _first_nonfinite_index(tensor)
+    if bad is None:
+        return
+    raise FloatingPointError(
+        f"Encountered non-finite values in {name} at {context}, tensor index {bad}."
+    )
+
+
+def _raise_on_nonfinite_model_grads(model, *, step: int) -> None:
+    for param_name, param in model.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        bad = _first_nonfinite_index(grad)
+        if bad is not None:
+            raise FloatingPointError(
+                "Encountered non-finite gradients "
+                f"at training step {step} in parameter {param_name}, tensor index {bad}."
+            )
+
+
+def _raise_on_nonfinite_model_params(model, *, step: int) -> None:
+    for param_name, param in model.named_parameters():
+        bad = _first_nonfinite_index(param)
+        if bad is not None:
+            raise FloatingPointError(
+                "Encountered non-finite parameter values "
+                f"after optimizer step {step} in parameter {param_name}, tensor index {bad}."
+            )
+
+
 @torch.no_grad()
-def _evaluate_accuracy(model, batches, device: torch.device) -> float:
+def _evaluate_accuracy(
+    model,
+    batches,
+    device: torch.device,
+    *,
+    use_amp: bool,
+    check_numerics: bool = False,
+) -> float:
     model.eval()
     correct = torch.zeros((), device=device, dtype=torch.int64)
     total = 0
-    use_amp = device.type == "cuda"
-    for x, lengths, labels in batches:
+    for batch_idx, (x, lengths, labels) in enumerate(batches, start=1):
         if x.device != device:
             x = x.to(device=device, non_blocking=True)
         if lengths.device != device:
@@ -305,6 +343,12 @@ def _evaluate_accuracy(model, batches, device: torch.device) -> float:
             labels = labels.to(device=device, non_blocking=True)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
             logits = model(x, lengths)
+        if check_numerics:
+            _raise_on_nonfinite_tensor(
+                "evaluation logits",
+                logits,
+                context=f"evaluation batch {batch_idx}",
+            )
         predictions = logits.argmax(dim=1)
         correct += (predictions == labels).sum()
         total += int(labels.shape[0])
@@ -502,44 +546,44 @@ def train_torch_model(
                 labels = labels.to(device=device, non_blocking=True)
 
             if check_numerics:
-                bad_input = _first_nonfinite_index(x)
-                if bad_input is not None:
-                    raise FloatingPointError(
-                        "Encountered non-finite input batch values "
-                        f"at training step {step + 1}, tensor index {bad_input}."
-                    )
+                _raise_on_nonfinite_tensor(
+                    "training inputs",
+                    x,
+                    context=f"training step {step + 1}",
+                )
 
             optimizer.zero_grad(set_to_none=True)
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
                 logits = model(x, lengths)
                 if check_numerics:
-                    bad_logits = _first_nonfinite_index(logits)
-                    if bad_logits is not None:
-                        raise FloatingPointError(
-                            "Encountered non-finite model logits "
-                            f"at training step {step + 1}, tensor index {bad_logits}."
-                        )
+                    _raise_on_nonfinite_tensor(
+                        "model logits",
+                        logits,
+                        context=f"training step {step + 1}",
+                    )
 
                 loss = F.cross_entropy(logits, labels)
-            if check_numerics and not bool(torch.isfinite(loss)):
-                loss_value = float(loss.detach().item())
-                raise FloatingPointError(
-                    "Encountered non-finite loss "
-                    f"at training step {step + 1}: loss={loss_value}."
+            if check_numerics:
+                _raise_on_nonfinite_tensor(
+                    "training loss",
+                    loss.reshape(1),
+                    context=f"training step {step + 1}",
                 )
 
             if use_amp:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             else:
                 loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            if check_numerics and not bool(torch.isfinite(grad_norm)):
-                grad_norm_value = float(grad_norm.detach().item())
-                raise FloatingPointError(
-                    "Encountered non-finite gradient norm "
-                    f"at training step {step + 1}: grad_norm={grad_norm_value}."
+            if check_numerics:
+                _raise_on_nonfinite_model_grads(model, step=step + 1)
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if check_numerics:
+                _raise_on_nonfinite_tensor(
+                    "gradient norm",
+                    grad_norm.reshape(1),
+                    context=f"training step {step + 1}",
                 )
 
             if use_amp:
@@ -547,12 +591,20 @@ def train_torch_model(
                 scaler.update()
             else:
                 optimizer.step()
+            if check_numerics:
+                _raise_on_nonfinite_model_params(model, step=step + 1)
             running_loss += loss.detach().to(dtype=running_loss.dtype)
 
             if (step + 1) % print_steps != 0:
                 continue
 
-            val_metric = _evaluate_accuracy(model, val_batches_factory(), device)
+            val_metric = _evaluate_accuracy(
+                model,
+                val_batches_factory(),
+                device,
+                use_amp=use_amp,
+                check_numerics=check_numerics,
+            )
             total_time = time.time() - start
             train_loss = float((running_loss / print_steps).item())
             logger.log(
@@ -600,7 +652,13 @@ def train_torch_model(
 
         if best_state_dict is not None:
             model.load_state_dict(best_state_dict)
-        best_test_metric = _evaluate_accuracy(model, test_batches_factory(), device)
+        best_test_metric = _evaluate_accuracy(
+            model,
+            test_batches_factory(),
+            device,
+            use_amp=use_amp,
+            check_numerics=check_numerics,
+        )
         logger.log(f"Test metric: {best_test_metric:.6f}")
         _save_metrics(
             output_dir,
@@ -659,6 +717,7 @@ def create_dataset_model_and_train_torch(
     mixed_precision: bool = False,
     torch_compile: bool = False,
     torch_compile_mode: str = "reduce-overhead",
+    check_numerics: bool = True,
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
 ):
@@ -708,7 +767,7 @@ def create_dataset_model_and_train_torch(
             f"seed={seed}, dataset={dataset_name}, include_time={include_time}, "
             f"T={T}, num_steps={num_steps}, print_steps={print_steps}, "
             f"batch_size={batch_size}, mixed_precision={mixed_precision}, "
-            f"torch_compile={torch_compile}, model_args={model_args}"
+            f"torch_compile={torch_compile}, check_numerics={check_numerics}, model_args={model_args}"
         )
         logger.log(f"Creating dataset {dataset_name}")
         dataset = create_torch_dataset(
@@ -753,6 +812,7 @@ def create_dataset_model_and_train_torch(
             verbose=verbose,
             progress_callback=progress_callback,
             logger=logger,
+            check_numerics=check_numerics,
         )
     except Exception:
         logger.exception("Training setup or execution failed.")

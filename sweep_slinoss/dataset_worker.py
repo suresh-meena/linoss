@@ -238,7 +238,7 @@ def run_task_group(
                     verbose=True,
                     progress_callback=None,
                     logger=run_logger,
-                    check_numerics=False,
+                    check_numerics=bool(run_args.get("check_numerics", True)),
                 )
             scan_status = "cute_ok"
             if used_reference_fallback:
