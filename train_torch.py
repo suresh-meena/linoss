@@ -360,12 +360,12 @@ def _evaluate_accuracy(
 def _make_optimizer(model, *, lr: float, device: torch.device, logger: _RunLogger):
     if device.type == "cuda":
         try:
-            optimizer = torch.optim.AdamW(model.parameters(), lr=lr, fused=True)
-            logger.log("Using fused AdamW optimizer.")
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr, fused=True)
+            logger.log("Using fused Adam optimizer.")
             return optimizer
         except (TypeError, RuntimeError):
-            logger.log("Fused AdamW unavailable; falling back to standard AdamW.")
-    return torch.optim.AdamW(model.parameters(), lr=lr)
+            logger.log("Fused Adam unavailable; falling back to standard Adam.")
+    return torch.optim.Adam(model.parameters(), lr=lr)
 
 
 def _save_metrics(
