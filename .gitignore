@@ -12,5 +12,7 @@ outputs/smoke_timing/
 **/training.log
 experiment_configs/repeats/logs/
 
+
+
 #Smoke
 sweep_slinoss/smoke_timing.py
