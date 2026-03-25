@@ -1,9 +1,10 @@
-"""CUDA-only SLinOSS classifier blocks for UEA experiments."""
+"""CUDA-only SLinOSS model blocks for Torch experiments."""
 
 from __future__ import annotations
 
 import math
 from importlib import import_module
+from typing import Any
 
 import torch
 from torch import nn
@@ -42,6 +43,11 @@ def ensure_slinoss_cuda_ready() -> None:
             "SLinOSS requires a CUDA-capable GPU with a CUDA-enabled PyTorch runtime. "
             "torch.cuda.is_available() is False on this machine."
         )
+    if cconv1d_is_available is None or cconv1d_load_error is None:
+        raise RuntimeError(
+            "SLinOSS cconv1d CUDA helpers are unavailable. Reinstall the published "
+            "`slinoss` wheel and verify that its CUDA extras import cleanly."
+        )
     if not cconv1d_is_available():
         detail = cconv1d_load_error()
         raise RuntimeError(
@@ -75,18 +81,71 @@ def _require_cuda_tensor(name: str, tensor: torch.Tensor) -> None:
         )
 
 
-class TokenBatchNormEMA(nn.Module):
-    """Apply BatchNorm1d to ``(batch, time, channels)`` tensors without transposes."""
+class BatchNormEMA(nn.Module):
+    """Equinox-style EMA BatchNorm over batch and time with no affine parameters."""
 
-    def __init__(self, d_model: int) -> None:
+    running_mean: torch.Tensor
+    running_var: torch.Tensor
+    _initialized: torch.Tensor
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        eps: float = 1e-5,
+        momentum: float = 0.99,
+    ) -> None:
         super().__init__()
-        self.bn = nn.BatchNorm1d(d_model, affine=True, track_running_stats=True)
+        self.eps = eps
+        self.momentum = momentum
+        self.register_buffer("running_mean", torch.zeros(d_model))
+        self.register_buffer("running_var", torch.ones(d_model))
+        self.register_buffer("_initialized", torch.tensor(False, dtype=torch.bool))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3:
+            raise ValueError(
+                "BatchNormEMA expects (batch, time, channels) inputs. "
+                f"Got shape {tuple(x.shape)}."
+            )
         batch, timesteps, channels = x.shape
-        x = x.reshape(batch * timesteps, channels)
-        x = self.bn(x)
-        return x.reshape(batch, timesteps, channels)
+        flat_x = x.reshape(batch * timesteps, channels)
+        stats_x = flat_x.to(dtype=torch.float32)
+
+        if self.training:
+            batch_mean = stats_x.mean(dim=0)
+            centered = stats_x - batch_mean
+            batch_var = centered.square().mean(dim=0).clamp_min_(0.0)
+            initialized = bool(self._initialized.item())
+
+            with torch.no_grad():
+                if initialized:
+                    self.running_mean.mul_(self.momentum).add_(
+                        batch_mean.detach(),
+                        alpha=1.0 - self.momentum,
+                    )
+                    self.running_var.mul_(self.momentum).add_(
+                        batch_var.detach(),
+                        alpha=1.0 - self.momentum,
+                    )
+                else:
+                    self.running_mean.copy_(batch_mean.detach())
+                    self.running_var.copy_(batch_var.detach())
+                    self._initialized.fill_(True)
+
+            mean = batch_mean
+            var = batch_var
+        else:
+            if bool(self._initialized.item()):
+                mean = self.running_mean
+                var = self.running_var
+            else:
+                mean = stats_x.mean(dim=0)
+                centered = stats_x - mean
+                var = centered.square().mean(dim=0).clamp_min_(0.0)
+
+        normalized = (stats_x - mean) / torch.sqrt(var + self.eps)
+        return normalized.to(dtype=x.dtype).reshape(batch, timesteps, channels)
 
 
 class SiLUFeedForward(nn.Module):
@@ -116,13 +175,23 @@ class StrictCudaCConv1dBackend:
 
     def __call__(
         self,
-        owner: SLinOSSMixer,
+        owner: Any,
         x: torch.Tensor,
         conv_state: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         _require_cuda_tensor("inputs", x)
         if conv_state is not None:
             _require_cuda_tensor("convolution state", conv_state)
+        if cconv1d_is_available is None or cconv1d_load_error is None:
+            raise RuntimeError(
+                "SLinOSS cconv1d CUDA helpers are unavailable. Reinstall the published "
+                "`slinoss` wheel and verify that its CUDA extras import cleanly."
+            )
+        if cconv1d_cuda_supported is None:
+            raise RuntimeError(
+                "SLinOSS cconv1d CUDA capability checks are unavailable. Reinstall the "
+                "published `slinoss` wheel and verify that its CUDA extras import cleanly."
+            )
         if not cconv1d_is_available():
             detail = cconv1d_load_error()
             raise RuntimeError(
@@ -180,8 +249,17 @@ class SLinOSSBlock(nn.Module):
                 "SLinOSS uses the CUDA causal-conv kernel exclusively, which "
                 f"currently supports d_conv in {{2, 3, 4}}. Got d_conv={d_conv}."
             )
+        if (
+            SLinOSSMixer is None
+            or CuteScanPrepBackend is None
+            or CuteScanBackend is None
+        ):
+            raise RuntimeError(
+                "SLinOSS CuTe scan components are unavailable. Reinstall the published "
+                "`slinoss` wheel and verify that its CUDA extras import cleanly."
+            )
 
-        self.norm = TokenBatchNormEMA(d_model)
+        self.norm = BatchNormEMA(d_model)
         self.mixer = SLinOSSMixer(
             d_model,
             d_state=d_state,
@@ -221,16 +299,18 @@ class SLinOSSBlock(nn.Module):
         return residual + x
 
 
-class SLinOSSClassifier(nn.Module):
-    """SLinOSS-based classifier for fixed-length UEA time-series inputs."""
+class SLinOSS(nn.Module):
+    """SLinOSS sequence model for classification and stepped sequence outputs."""
 
     def __init__(
         self,
         input_dim: int,
-        num_classes: int,
+        output_dim: int,
         *,
         d_model: int,
         n_layers: int,
+        classification: bool = True,
+        output_step: int = 1,
         d_state: int = 128,
         expand: int = 2,
         d_head: int = 64,
@@ -249,6 +329,15 @@ class SLinOSSClassifier(nn.Module):
     ) -> None:
         super().__init__()
         ensure_slinoss_cuda_ready()
+        if classification and output_dim <= 1:
+            raise ValueError(
+                "SLinOSS classification requires output_dim >= 2. "
+                f"Got output_dim={output_dim}."
+            )
+        if output_step <= 0:
+            raise ValueError(
+                f"output_step must be positive. Got output_step={output_step}."
+            )
 
         self.input_proj = nn.Linear(input_dim, d_model)
         self.blocks = nn.ModuleList(
@@ -274,36 +363,82 @@ class SLinOSSClassifier(nn.Module):
                 for _ in range(n_layers)
             ]
         )
-        self.output_norm = TokenBatchNormEMA(d_model)
-        self.head = nn.Linear(d_model, num_classes)
+        self.classification = classification
+        self.output_step = output_step
+        self.output_norm = BatchNormEMA(d_model)
+        self.head = nn.Linear(d_model, output_dim)
 
     @staticmethod
     def _mean_pool(x: torch.Tensor) -> torch.Tensor:
         return x.mean(dim=1)
 
+    def _downsample_valid_steps(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        step_outputs = x[:, self.output_step - 1 :: self.output_step]
+        if step_outputs.shape[1] == 0:
+            empty_mask = torch.zeros(
+                (x.shape[0], 0),
+                dtype=torch.bool,
+                device=x.device,
+            )
+            return step_outputs, empty_mask
+
+        valid_counts = torch.clamp(
+            torch.div(
+                lengths - self.output_step,
+                self.output_step,
+                rounding_mode="floor",
+            )
+            + 1,
+            min=0,
+        )
+        time_index = torch.arange(step_outputs.shape[1], device=x.device)
+        valid_mask = time_index.unsqueeze(0) < valid_counts.unsqueeze(1)
+        return step_outputs, valid_mask
+
     def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
         _require_cuda_tensor("inputs", x)
-        _require_cuda_tensor("sequence lengths", lengths)
         if x.ndim != 3:
             raise ValueError(
                 f"Expected inputs with shape (batch, time, channels). Got {tuple(x.shape)}."
             )
-        if lengths.ndim != 1 or lengths.shape[0] != x.shape[0]:
-            raise ValueError(
-                "Expected lengths with shape (batch,). "
-                f"Got {tuple(lengths.shape)} for batch size {x.shape[0]}."
-            )
-        # The Torch UEA pipeline always emits fixed-length sequences, so a plain
-        # mean over time is equivalent to masked pooling without the extra mask.
 
         x = self.input_proj(x)
         for block in self.blocks:
             x = block(x)
         x = self.output_norm(x)
-        pooled = self._mean_pool(x)
-        return self.head(pooled)
+        if self.classification:
+            pooled = self._mean_pool(x)
+            return self.head(pooled)
+
+        _require_cuda_tensor("sequence lengths", lengths)
+        if lengths.ndim != 1 or lengths.shape[0] != x.shape[0]:
+            raise ValueError(
+                "Expected lengths with shape (batch,). "
+                f"Got {tuple(lengths.shape)} for batch size {x.shape[0]}."
+            )
+        if torch.any(lengths <= 0):
+            raise ValueError("All sequence lengths must be positive.")
+        if torch.any(lengths > x.shape[1]):
+            raise ValueError(
+                "Sequence lengths cannot exceed the input time dimension. "
+                f"Got max length {int(lengths.max().item())} for time dimension {x.shape[1]}."
+            )
+        step_outputs, valid_mask = self._downsample_valid_steps(x, lengths)
+        predictions = torch.tanh(self.head(step_outputs))
+        return predictions.masked_fill(~valid_mask.unsqueeze(-1), 0.0)
 
 
-SLinOSS = SLinOSSClassifier
+SLinOSSClassifier = SLinOSS
+TokenBatchNormEMA = BatchNormEMA
 
-__all__ = ["SLinOSS", "SLinOSSClassifier", "ensure_slinoss_cuda_ready"]
+__all__ = [
+    "SLinOSS",
+    "SLinOSSClassifier",
+    "BatchNormEMA",
+    "TokenBatchNormEMA",
+    "ensure_slinoss_cuda_ready",
+]
