@@ -22,7 +22,5 @@
     "lr": "0.00001",
     "n_layers": "2",
     "d_model": "128",
-    "d_state": "16",
-    "torch_compile": true,
-    "torch_compile_mode": "reduce-overhead"
+    "d_state": "16"
 }

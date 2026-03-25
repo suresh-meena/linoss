@@ -16,11 +16,11 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-# Prevent file descriptor leaks in sweeps
-torch.multiprocessing.set_sharing_strategy("file_system")
-
 from data_dir.torch_datasets import TorchDataset, create_torch_dataset
 from models.generate_torch_model import create_torch_model
+
+# Prevent file descriptor leaks in sweeps
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 
 @dataclass
@@ -95,7 +95,9 @@ def _configure_cuda_training_runtime(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         if logger is not None:
-            logger.log("Enabled CUDA TF32 matmul/cudnn execution for faster float32 training.")
+            logger.log(
+                "Enabled CUDA TF32 matmul/cudnn execution for faster float32 training."
+            )
         return
 
     torch.set_float32_matmul_precision("highest")
@@ -129,7 +131,10 @@ def _prepare_output_dir(
             shutil.rmtree(output_dir)
             os.makedirs(output_dir)
             if verbose:
-                print(f"Directory {output_dir} has been deleted and recreated.", flush=True)
+                print(
+                    f"Directory {output_dir} has been deleted and recreated.",
+                    flush=True,
+                )
             return
 
         if prompt_if_exists:
@@ -141,7 +146,10 @@ def _prepare_output_dir(
                 shutil.rmtree(output_dir)
                 os.makedirs(output_dir)
                 if verbose:
-                    print(f"Directory {output_dir} has been deleted and recreated.", flush=True)
+                    print(
+                        f"Directory {output_dir} has been deleted and recreated.",
+                        flush=True,
+                    )
                 return
             raise ValueError(f"Directory {output_dir} already exists. Exiting.")
 
@@ -264,7 +272,7 @@ def _make_loader(
     # and CUDA/spawn instability in PyTorch multiprocessing.
     worker_count = 0
 
-    loader_kwargs = dict(
+    return DataLoader(
         dataset=dataset,
         batch_size=batch_size,
         shuffle=shuffle,
@@ -273,9 +281,6 @@ def _make_loader(
         num_workers=worker_count,
         pin_memory=pin_memory,
     )
-    return DataLoader(
-        **loader_kwargs,
-    )
 
 
 def _move_tensor_dataset_to_device(dataset, device: torch.device):
@@ -283,10 +288,14 @@ def _move_tensor_dataset_to_device(dataset, device: torch.device):
         return dataset
     if all(t.device == device for t in dataset.tensors):
         return dataset
-    return type(dataset)(*[t.to(device=device, non_blocking=True) for t in dataset.tensors])
+    return type(dataset)(
+        *[t.to(device=device, non_blocking=True) for t in dataset.tensors]
+    )
 
 
-def _move_dataset_to_device(dataset: TorchDataset, device: torch.device) -> TorchDataset:
+def _move_dataset_to_device(
+    dataset: TorchDataset, device: torch.device
+) -> TorchDataset:
     dataset.train = _move_tensor_dataset_to_device(dataset.train, device)
     dataset.val = _move_tensor_dataset_to_device(dataset.val, device)
     dataset.test = _move_tensor_dataset_to_device(dataset.test, device)
@@ -316,7 +325,9 @@ def _iter_tensor_batches(
             indices = indices.to(device=tensors[0].device, non_blocking=True)
         for start in range(0, limit, batch_size):
             batch_indices = indices[start : start + batch_size]
-            yield tuple(torch.index_select(tensor, 0, batch_indices) for tensor in tensors)
+            yield tuple(
+                torch.index_select(tensor, 0, batch_indices) for tensor in tensors
+            )
         return
 
     for start in range(0, limit, batch_size):
@@ -346,6 +357,29 @@ def _infinite_batches(loader: DataLoader):
     while True:
         for batch in loader:
             yield batch
+
+
+def _tensor_batches_factory(
+    dataset,
+    *,
+    batch_size: int,
+):
+    def factory():
+        return _iter_tensor_batches(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            drop_last=False,
+        )
+
+    return factory
+
+
+def _loader_batches_factory(loader: DataLoader):
+    def factory():
+        return loader
+
+    return factory
 
 
 def _close_iterator(iterator) -> None:
@@ -381,7 +415,9 @@ def _evaluate_accuracy(
             lengths = lengths.to(device=device, non_blocking=True)
         if labels.device != device:
             labels = labels.to(device=device, non_blocking=True)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+        with torch.autocast(
+            device_type=device.type, dtype=torch.float16, enabled=use_amp
+        ):
             logits = model(x, lengths)
         predictions = logits.argmax(dim=1)
         correct += (predictions == labels).sum()
@@ -422,7 +458,9 @@ def _save_metrics(
     all_time: list[float],
     test_metric: float,
 ) -> None:
-    steps = np.arange(print_steps, (len(all_train_metric) + 1) * print_steps, print_steps)
+    steps = np.arange(
+        print_steps, (len(all_train_metric) + 1) * print_steps, print_steps
+    )
     np.save(os.path.join(output_dir, "steps.npy"), steps)
     np.save(
         os.path.join(output_dir, "all_train_metric.npy"),
@@ -450,14 +488,18 @@ def load_torch_training_summary(output_dir: str) -> TorchTrainingSummary:
     test_metric = np.load(os.path.join(output_dir, "test_metric.npy"))
 
     completed_steps = int(steps[-1]) if steps.size else 0
-    best_validation_metric = float(np.max(validation)) if validation.size else float("-inf")
+    best_validation_metric = (
+        float(np.max(validation)) if validation.size else float("-inf")
+    )
     return TorchTrainingSummary(
         output_dir=output_dir,
         completed_steps=completed_steps,
         best_validation_metric=best_validation_metric,
         test_metric=float(np.asarray(test_metric).item()),
         train_loss_history=tuple(float(x) for x in np.asarray(train_loss).tolist()),
-        validation_metric_history=tuple(float(x) for x in np.asarray(validation).tolist()),
+        validation_metric_history=tuple(
+            float(x) for x in np.asarray(validation).tolist()
+        ),
         elapsed_time_history=tuple(float(x) for x in np.asarray(elapsed).tolist()),
     )
 
@@ -514,7 +556,9 @@ def train_torch_model(
             logger.close()
         raise ValueError("weight_decay must be >= 0.")
     if grad_clip_norm is not None and grad_clip_norm <= 0:
-        logger.log(f"Invalid grad_clip_norm value {grad_clip_norm}; expected > 0 or None.")
+        logger.log(
+            f"Invalid grad_clip_norm value {grad_clip_norm}; expected > 0 or None."
+        )
         if owns_logger:
             logger.close()
         raise ValueError("grad_clip_norm must be > 0 when provided.")
@@ -550,7 +594,11 @@ def train_torch_model(
     use_amp = mixed_precision and device.type == "cuda"
     effective_lr = lr_scheduler(lr)
     use_tensor_batching = dataset_is_on_gpu
-    early_stop_after = print_steps if min_steps_before_early_stop is None else min_steps_before_early_stop
+    early_stop_after = (
+        print_steps
+        if min_steps_before_early_stop is None
+        else min_steps_before_early_stop
+    )
 
     logger.log(
         "Starting training run: "
@@ -579,17 +627,13 @@ def train_torch_model(
             drop_last=True,
             generator=train_generator,
         )
-        val_batches_factory = lambda: _iter_tensor_batches(
+        val_batches_factory = _tensor_batches_factory(
             dataset.val,
             batch_size=batch_size,
-            shuffle=False,
-            drop_last=False,
         )
-        test_batches_factory = lambda: _iter_tensor_batches(
+        test_batches_factory = _tensor_batches_factory(
             dataset.test,
             batch_size=batch_size,
-            shuffle=False,
-            drop_last=False,
         )
     else:
         train_loader = _make_loader(
@@ -618,8 +662,10 @@ def train_torch_model(
             num_workers=0,
         )
         train_batches = _infinite_batches(train_loader)
-        val_batches_factory = lambda: val_loader
-        test_batches_factory = lambda: test_loader
+        assert val_loader is not None
+        assert test_loader is not None
+        val_batches_factory = _loader_batches_factory(val_loader)
+        test_batches_factory = _loader_batches_factory(test_loader)
 
     optimizer = _make_optimizer(
         model,
@@ -628,7 +674,7 @@ def train_torch_model(
         device=device,
         logger=logger,
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     running_loss = torch.zeros((), device=device, dtype=torch.float32)
     all_train_metric: list[float] = []
@@ -660,7 +706,9 @@ def train_torch_model(
                     )
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            with torch.autocast(
+                device_type=device.type, dtype=torch.float16, enabled=use_amp
+            ):
                 logits = model(x, lengths)
                 if check_numerics:
                     bad_logits = _first_nonfinite_index(logits)
@@ -697,7 +745,11 @@ def train_torch_model(
                     )
                 else:
                     grad_norm = torch.zeros((), device=device, dtype=torch.float32)
-            if check_numerics and grad_clip_norm is not None and not bool(torch.isfinite(grad_norm)):
+            if (
+                check_numerics
+                and grad_clip_norm is not None
+                and not bool(torch.isfinite(grad_norm))
+            ):
                 grad_norm_value = float(grad_norm.detach().item())
                 raise FloatingPointError(
                     "Encountered non-finite gradient norm "
@@ -754,7 +806,8 @@ def train_torch_model(
             if val_metric > best_val_metric:
                 best_val_metric = val_metric
                 best_state_dict = {
-                    key: value.detach().cpu().clone() for key, value in model.state_dict().items()
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()
                 }
                 logger.log(f"New best validation metric: {best_val_metric:.6f}")
 
@@ -795,9 +848,16 @@ def train_torch_model(
         del train_batches
 
         # Explicitly shutdown DataLoader workers to prevent file descriptor leaks.
-        if train_loader is not None and hasattr(train_loader, "_iterator") and train_loader._iterator is not None:
-            if hasattr(train_loader._iterator, "_shutdown_workers"):
-                train_loader._iterator._shutdown_workers()
+        if (
+            train_loader is not None
+            and hasattr(train_loader, "_iterator")
+            and train_loader._iterator is not None
+        ):
+            shutdown_workers = getattr(
+                train_loader._iterator, "_shutdown_workers", None
+            )
+            if callable(shutdown_workers):
+                shutdown_workers()
 
         del train_loader
         del val_loader
@@ -839,9 +899,6 @@ def create_dataset_model_and_train_torch(
     grad_clip_norm: float | None = 1.0,
     early_stopping_patience: int | None = 10,
     min_steps_before_early_stop: int | None = None,
-    torch_compile: bool = False,
-    torch_compile_mode: str = "reduce-overhead",
-    torch_compile_dynamic: bool = False,
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
 ):
@@ -886,9 +943,6 @@ def create_dataset_model_and_train_torch(
         grad_clip_norm=grad_clip_norm,
         early_stopping_patience=early_stopping_patience,
         min_steps_before_early_stop=min_steps_before_early_stop,
-        torch_compile=torch_compile,
-        torch_compile_mode=torch_compile_mode,
-        torch_compile_dynamic=torch_compile_dynamic,
         verbose=verbose,
         progress_callback=progress_callback,
         prompt_if_output_dir_exists=True,
@@ -921,9 +975,6 @@ def run_slinoss_training(
     grad_clip_norm: float | None = 1.0,
     early_stopping_patience: int | None = 10,
     min_steps_before_early_stop: int | None = None,
-    torch_compile: bool = False,
-    torch_compile_mode: str = "reduce-overhead",
-    torch_compile_dynamic: bool = False,
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
     prompt_if_output_dir_exists: bool = False,
@@ -944,9 +995,9 @@ def run_slinoss_training(
 
     # Use native python/numpy/torch random to generate seeds instead of jax
     gen = torch.Generator().manual_seed(seed)
-    datasetkey = torch.randint(0, 2**32, (1,), generator=gen).item()
-    modelkey = torch.randint(0, 2**32, (1,), generator=gen).item()
-    shufflekey = torch.randint(0, 2**32, (1,), generator=gen).item()
+    datasetkey = int(torch.randint(0, 2**32, (1,), generator=gen).item())
+    modelkey = int(torch.randint(0, 2**32, (1,), generator=gen).item())
+    shufflekey = int(torch.randint(0, 2**32, (1,), generator=gen).item())
 
     try:
         logger.log(
@@ -958,8 +1009,7 @@ def run_slinoss_training(
             f"weight_decay={weight_decay}, grad_clip_norm={grad_clip_norm}, "
             f"early_stopping_patience={early_stopping_patience}, "
             f"min_steps_before_early_stop={min_steps_before_early_stop}, "
-            f"torch_compile={torch_compile}, torch_compile_mode={torch_compile_mode}, "
-            f"torch_compile_dynamic={torch_compile_dynamic}, model_args={model_args}"
+            f"model_args={model_args}"
         )
         logger.log(f"Creating dataset {dataset_name}")
         dataset = create_torch_dataset(
@@ -984,17 +1034,6 @@ def run_slinoss_training(
             dataset.label_dim,
             model_args=model_args,
         ).to(device)
-
-        if torch_compile:
-            logger.log(
-                "Compiling model with "
-                f"mode={torch_compile_mode}, dynamic={torch_compile_dynamic}"
-            )
-            model = torch.compile(
-                model,
-                mode=torch_compile_mode,
-                dynamic=torch_compile_dynamic,
-            )
 
         trained_model = train_torch_model(
             dataset,

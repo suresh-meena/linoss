@@ -5,8 +5,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
-from typing import Callable
+from typing import Any, Callable
 
+import diffrax
+
+from train import create_dataset_model_and_train
 from train_torch import create_dataset_model_and_train_torch
 
 
@@ -22,7 +25,11 @@ def _parse_bool(value) -> bool:
     return bool(value)
 
 
-def _first_present(config, keys, default=_MISSING):
+def _first_present(
+    config: dict[str, Any],
+    keys: tuple[str, ...],
+    default: Any = _MISSING,
+) -> Any:
     for key in keys:
         value = config.get(key)
         if value is not None:
@@ -33,7 +40,10 @@ def _first_present(config, keys, default=_MISSING):
     raise KeyError(f"Missing required config key. Expected one of: {key_list}.")
 
 
-def _build_jax_model_args(model_name: str, config: dict) -> tuple[dict, int, int, str | None]:
+def _build_jax_model_args(
+    model_name: str,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], int, int, str | None]:
     if model_name == "LinOSS":
         linoss_discretization = config["linoss_discretization"]
     else:
@@ -89,7 +99,9 @@ def _build_jax_model_args(model_name: str, config: dict) -> tuple[dict, int, int
     return model_args, stepsize, logsig_depth, linoss_discretization
 
 
-def _build_slinoss_model_args(config: dict) -> tuple[dict, int, int, None]:
+def _build_slinoss_model_args(
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], int, int, None]:
     d_model = int(_first_present(config, ("d_model", "hidden_dim")))
     n_layers = int(_first_present(config, ("n_layers", "num_blocks")))
     d_state = int(_first_present(config, ("d_state", "ssm_dim"), default=128))
@@ -125,17 +137,19 @@ def _build_slinoss_model_args(config: dict) -> tuple[dict, int, int, None]:
 def _build_run_args(
     model_name: str,
     dataset_name: str,
-    config: dict,
-) -> tuple[dict, Callable]:
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], Callable[..., Any]]:
     if model_name in TORCH_MODELS:
-        model_args, stepsize, logsig_depth, linoss_discretization = _build_slinoss_model_args(
-            config
+        model_args, stepsize, logsig_depth, linoss_discretization = (
+            _build_slinoss_model_args(config)
         )
         run_fn = create_dataset_model_and_train_torch
     else:
-        model_args, stepsize, logsig_depth, linoss_discretization = _build_jax_model_args(
-            model_name,
-            config,
+        model_args, stepsize, logsig_depth, linoss_discretization = (
+            _build_jax_model_args(
+                model_name,
+                config,
+            )
         )
         run_fn = create_dataset_model_and_train
 
@@ -161,11 +175,6 @@ def _build_run_args(
         "id": config.get("id"),
     }
     if model_name in TORCH_MODELS:
-        run_args["torch_compile"] = _parse_bool(config.get("torch_compile", False))
-        run_args["torch_compile_mode"] = config.get("torch_compile_mode", "reduce-overhead")
-        run_args["torch_compile_dynamic"] = _parse_bool(
-            config.get("torch_compile_dynamic", False)
-        )
         run_args["allow_tf32"] = _parse_bool(config.get("allow_tf32", False))
         run_args["mixed_precision"] = _parse_bool(config.get("mixed_precision", False))
         run_args["check_numerics"] = _parse_bool(config.get("check_numerics", True))
@@ -176,9 +185,7 @@ def _build_run_args(
         )
         early_stopping_patience = config.get("early_stopping_patience", 10)
         run_args["early_stopping_patience"] = (
-            None
-            if early_stopping_patience is None
-            else int(early_stopping_patience)
+            None if early_stopping_patience is None else int(early_stopping_patience)
         )
         min_steps_before_early_stop = config.get("min_steps_before_early_stop")
         run_args["min_steps_before_early_stop"] = (
