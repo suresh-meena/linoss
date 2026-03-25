@@ -1,0 +1,195 @@
+{
+  "name": "slinoss-uea-grid",
+  "output_root": "outputs/sweeps/slinoss-uea-grid",
+  "defaults": {
+    "dataset": {
+      "data_dir": "data_dir",
+      "use_presplit": false,
+      "include_time": true,
+      "T": 1.0
+    },
+    "training": {
+      "num_steps": 20000,
+      "print_steps": 1000,
+      "lr": 0.001,
+      "lr_scheduler": "identity",
+      "batch_size": 2,
+      "allow_tf32": false,
+      "mixed_precision": false,
+      "check_numerics": true,
+      "weight_decay": 0.0,
+      "grad_clip_norm": 1.0,
+      "early_stopping_patience": 10,
+      "min_steps_before_early_stop": 1000,
+      "dataloader_workers": 0
+    },
+    "model": {
+      "d_model": 16,
+      "n_layers": 2,
+      "d_state": 16,
+      "expand": 2,
+      "d_head": 16,
+      "d_conv": 4,
+      "chunk_size": 64,
+      "dropout": 0.0,
+      "ffn_mult": 2
+    }
+  },
+  "grid": {
+    "dataset": {
+      "include_time": [false, true]
+    },
+    "training": {
+      "lr": [0.001, 0.0001, 0.00001]
+    },
+    "model": {
+      "n_layers": [2, 4, 6]
+    }
+  },
+  "datasets": [
+    {
+      "name": "EigenWorms",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 8},
+        "model": {"d_model": 16, "d_head": 16, "d_state": 16}
+      }
+    },
+    {
+      "name": "EigenWorms",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 2},
+        "model": {"d_model": 64, "d_head": 32, "d_state": 16}
+      }
+    },
+    {
+      "name": "EigenWorms",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 1},
+        "model": {"d_model": 128, "d_head": 64, "d_state": 64}
+      }
+    },
+    {
+      "name": "EthanolConcentration",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 32},
+        "model": {"d_model": 16, "d_head": 16, "d_state": 16}
+      }
+    },
+    {
+      "name": "EthanolConcentration",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 32},
+        "model": {"d_model": 64, "d_head": 32, "d_state": 16}
+      }
+    },
+    {
+      "name": "EthanolConcentration",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 8},
+        "model": {"d_model": 128, "d_head": 64, "d_state": 64}
+      }
+    },
+    {
+      "name": "Heartbeat",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 32},
+        "model": {"d_model": 16, "d_head": 16, "d_state": 16}
+      }
+    },
+    {
+      "name": "Heartbeat",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 32},
+        "model": {"d_model": 64, "d_head": 32, "d_state": 16}
+      }
+    },
+    {
+      "name": "Heartbeat",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 32},
+        "model": {"d_model": 128, "d_head": 64, "d_state": 64}
+      }
+    },
+    {
+      "name": "MotorImagery",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 32},
+        "model": {"d_model": 16, "d_head": 16, "d_state": 16}
+      }
+    },
+    {
+      "name": "MotorImagery",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 16},
+        "model": {"d_model": 64, "d_head": 32, "d_state": 16}
+      }
+    },
+    {
+      "name": "MotorImagery",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 8},
+        "model": {"d_model": 128, "d_head": 64, "d_state": 64}
+      }
+    },
+    {
+      "name": "SelfRegulationSCP1",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 32},
+        "model": {"d_model": 16, "d_head": 16, "d_state": 16}
+      }
+    },
+    {
+      "name": "SelfRegulationSCP1",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 32},
+        "model": {"d_model": 64, "d_head": 32, "d_state": 16}
+      }
+    },
+    {
+      "name": "SelfRegulationSCP1",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 16},
+        "model": {"d_model": 128, "d_head": 64, "d_state": 64}
+      }
+    },
+    {
+      "name": "SelfRegulationSCP2",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 32},
+        "model": {"d_model": 16, "d_head": 16, "d_state": 16}
+      }
+    },
+    {
+      "name": "SelfRegulationSCP2",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 32},
+        "model": {"d_model": 64, "d_head": 32, "d_state": 16}
+      }
+    },
+    {
+      "name": "SelfRegulationSCP2",
+      "seeds": [2345, 3456, 4567, 5678, 6789],
+      "overrides": {
+        "training": {"batch_size": 16},
+        "model": {"d_model": 128, "d_head": 64, "d_state": 64}
+      }
+    }
+  ]
+}
