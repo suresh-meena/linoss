@@ -530,6 +530,8 @@ def create_slinoss_model(
     model_args: Mapping[str, Any],
     model_seed: int,
     device: torch.device,
+    classification: bool = True,
+    output_step: int = 1,
     allow_tf32: bool = False,
     logger: _RunLogger | None = None,
 ):
@@ -542,6 +544,8 @@ def create_slinoss_model(
         dataset.data_dim,
         dataset.label_dim,
         model_args=dict(model_args),
+        classification=classification,
+        output_step=output_step,
     ).to(device)
 
 
@@ -968,12 +972,17 @@ def create_dataset_model_and_train_torch(
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
 ):
-    del output_step, stepsize, logsig_depth, linoss_discretization, id
+    del stepsize, logsig_depth, linoss_discretization, id
 
     if model_name != "SLinOSS":
         raise ValueError(f"Unknown Torch training model: {model_name}")
-    if metric != "accuracy":
-        raise ValueError("SLinOSS Torch training currently supports accuracy only.")
+    classification = metric == "accuracy"
+    if not classification:
+        raise ValueError(
+            "SLinOSS Torch training currently supports accuracy only. "
+            "The model now supports non-classification outputs, but the Torch "
+            "trainer/data pipeline here has not been extended for regression yet."
+        )
 
     full_output_dir = build_slinoss_output_dir(
         seed=seed,
@@ -1009,6 +1018,8 @@ def create_dataset_model_and_train_torch(
         grad_clip_norm=grad_clip_norm,
         early_stopping_patience=early_stopping_patience,
         min_steps_before_early_stop=min_steps_before_early_stop,
+        classification=classification,
+        output_step=output_step,
         device=device,
         verbose=verbose,
         progress_callback=progress_callback,
@@ -1042,6 +1053,8 @@ def run_slinoss_training(
     grad_clip_norm: float | None = 1.0,
     early_stopping_patience: int | None = 10,
     min_steps_before_early_stop: int | None = None,
+    classification: bool = True,
+    output_step: int = 1,
     device: str | torch.device = "cuda",
     dataset: TorchDataset | None = None,
     run_seeds: SLinOSSRunSeeds | None = None,
@@ -1074,6 +1087,7 @@ def run_slinoss_training(
             f"weight_decay={weight_decay}, grad_clip_norm={grad_clip_norm}, "
             f"early_stopping_patience={early_stopping_patience}, "
             f"min_steps_before_early_stop={min_steps_before_early_stop}, "
+            f"classification={classification}, output_step={output_step}, "
             f"device={device}, "
             f"model_args={model_args}"
         )
@@ -1098,6 +1112,8 @@ def run_slinoss_training(
             model_args=model_args,
             model_seed=run_seeds.model_seed,
             device=device,
+            classification=classification,
+            output_step=output_step,
             allow_tf32=allow_tf32,
             logger=logger,
         )

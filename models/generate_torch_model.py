@@ -9,17 +9,19 @@ def create_torch_model(
     label_dim: int,
     *,
     model_args: dict,
+    classification: bool = True,
+    output_step: int = 1,
 ):
     if model_name != "SLinOSS":
         raise ValueError(f"Unknown Torch model name: {model_name}")
-    if label_dim <= 1:
-        raise ValueError(
-            "SLinOSSClassifier is classification-only and requires at least two classes."
-        )
-    from models.SLinOSS import SLinOSSClassifier
+    if classification and label_dim <= 1:
+        raise ValueError("SLinOSS classification requires at least two output classes.")
+    from models.SLinOSS import SLinOSS
 
-    return SLinOSSClassifier(
+    return SLinOSS(
         input_dim=input_dim,
-        num_classes=label_dim,
+        output_dim=label_dim,
+        classification=classification,
+        output_step=output_step,
         **model_args,
     )
