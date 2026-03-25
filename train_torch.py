@@ -9,7 +9,7 @@ import hashlib
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, TextIO
+from typing import Any, Callable, Mapping, TextIO
 
 import numpy as np
 import torch
@@ -71,6 +71,13 @@ class SLinOSSRunResult:
     model: torch.nn.Module
     output_dir: str
     summary: TorchTrainingSummary
+
+
+@dataclass(frozen=True)
+class SLinOSSRunSeeds:
+    dataset_seed: int
+    model_seed: int
+    shuffle_seed: int
 
 
 def _create_run_logger(output_dir: str, *, verbose: bool) -> _RunLogger:
@@ -478,6 +485,64 @@ def _set_torch_seed(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def derive_slinoss_run_seeds(seed: int) -> SLinOSSRunSeeds:
+    gen = torch.Generator().manual_seed(seed)
+    return SLinOSSRunSeeds(
+        dataset_seed=int(torch.randint(0, 2**32, (1,), generator=gen).item()),
+        model_seed=int(torch.randint(0, 2**32, (1,), generator=gen).item()),
+        shuffle_seed=int(torch.randint(0, 2**32, (1,), generator=gen).item()),
+    )
+
+
+def create_slinoss_dataset(
+    *,
+    data_dir: str,
+    use_presplit: bool,
+    dataset_name: str,
+    include_time: bool,
+    T: float,
+    dataset_seed: int,
+    logger: _RunLogger | None = None,
+) -> TorchDataset:
+    if logger is not None:
+        logger.log(f"Creating dataset {dataset_name}")
+    dataset = create_torch_dataset(
+        data_dir,
+        dataset_name,
+        use_presplit,
+        include_time,
+        T,
+        key=dataset_seed,
+    )
+    if logger is not None:
+        logger.log(
+            "Dataset created: "
+            f"train={len(dataset.train)}, val={len(dataset.val)}, test={len(dataset.test)}"
+        )
+    return dataset
+
+
+def create_slinoss_model(
+    *,
+    dataset: TorchDataset,
+    model_args: Mapping[str, Any],
+    model_seed: int,
+    device: torch.device,
+    allow_tf32: bool = False,
+    logger: _RunLogger | None = None,
+):
+    if logger is not None:
+        logger.log("Creating model SLinOSS")
+    _configure_cuda_training_runtime(allow_tf32=allow_tf32, logger=logger)
+    _set_torch_seed(model_seed)
+    return create_torch_model(
+        "SLinOSS",
+        dataset.data_dim,
+        dataset.label_dim,
+        model_args=dict(model_args),
+    ).to(device)
 
 
 def load_torch_training_summary(output_dir: str) -> TorchTrainingSummary:
@@ -899,6 +964,7 @@ def create_dataset_model_and_train_torch(
     grad_clip_norm: float | None = 1.0,
     early_stopping_patience: int | None = 10,
     min_steps_before_early_stop: int | None = None,
+    device: str | torch.device = "cuda",
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
 ):
@@ -943,6 +1009,7 @@ def create_dataset_model_and_train_torch(
         grad_clip_norm=grad_clip_norm,
         early_stopping_patience=early_stopping_patience,
         min_steps_before_early_stop=min_steps_before_early_stop,
+        device=device,
         verbose=verbose,
         progress_callback=progress_callback,
         prompt_if_output_dir_exists=True,
@@ -975,6 +1042,9 @@ def run_slinoss_training(
     grad_clip_norm: float | None = 1.0,
     early_stopping_patience: int | None = 10,
     min_steps_before_early_stop: int | None = None,
+    device: str | torch.device = "cuda",
+    dataset: TorchDataset | None = None,
+    run_seeds: SLinOSSRunSeeds | None = None,
     verbose: bool = True,
     progress_callback: Callable[[int, int], None] | None = None,
     prompt_if_output_dir_exists: bool = False,
@@ -982,7 +1052,8 @@ def run_slinoss_training(
     from models.SLinOSS import ensure_slinoss_cuda_ready
 
     ensure_slinoss_cuda_ready()
-    device = torch.device("cuda")
+    device = torch.device(device)
+    run_seeds = derive_slinoss_run_seeds(seed) if run_seeds is None else run_seeds
 
     _prepare_output_dir(
         output_dir,
@@ -992,12 +1063,6 @@ def run_slinoss_training(
         verbose=verbose,
     )
     logger = _create_run_logger(output_dir, verbose=verbose)
-
-    # Use native python/numpy/torch random to generate seeds instead of jax
-    gen = torch.Generator().manual_seed(seed)
-    datasetkey = int(torch.randint(0, 2**32, (1,), generator=gen).item())
-    modelkey = int(torch.randint(0, 2**32, (1,), generator=gen).item())
-    shufflekey = int(torch.randint(0, 2**32, (1,), generator=gen).item())
 
     try:
         logger.log(
@@ -1009,31 +1074,33 @@ def run_slinoss_training(
             f"weight_decay={weight_decay}, grad_clip_norm={grad_clip_norm}, "
             f"early_stopping_patience={early_stopping_patience}, "
             f"min_steps_before_early_stop={min_steps_before_early_stop}, "
+            f"device={device}, "
             f"model_args={model_args}"
         )
-        logger.log(f"Creating dataset {dataset_name}")
-        dataset = create_torch_dataset(
-            data_dir,
-            dataset_name,
-            use_presplit,
-            include_time,
-            T,
-            key=datasetkey,
-        )
-        logger.log(
-            "Dataset created: "
-            f"train={len(dataset.train)}, val={len(dataset.val)}, test={len(dataset.test)}"
-        )
+        if dataset is None:
+            dataset = create_slinoss_dataset(
+                data_dir=data_dir,
+                use_presplit=use_presplit,
+                dataset_name=dataset_name,
+                include_time=include_time,
+                T=T,
+                dataset_seed=run_seeds.dataset_seed,
+                logger=logger,
+            )
+        else:
+            logger.log(
+                "Using caller-provided dataset: "
+                f"train={len(dataset.train)}, val={len(dataset.val)}, test={len(dataset.test)}"
+            )
 
-        logger.log("Creating model SLinOSS")
-        _configure_cuda_training_runtime(allow_tf32=allow_tf32, logger=logger)
-        _set_torch_seed(modelkey)
-        model = create_torch_model(
-            "SLinOSS",
-            dataset.data_dim,
-            dataset.label_dim,
+        model = create_slinoss_model(
+            dataset=dataset,
             model_args=model_args,
-        ).to(device)
+            model_seed=run_seeds.model_seed,
+            device=device,
+            allow_tf32=allow_tf32,
+            logger=logger,
+        )
 
         trained_model = train_torch_model(
             dataset,
@@ -1043,7 +1110,7 @@ def run_slinoss_training(
             lr=lr,
             lr_scheduler=lr_scheduler,
             batch_size=batch_size,
-            shuffle_seed=shufflekey,
+            shuffle_seed=run_seeds.shuffle_seed,
             output_dir=output_dir,
             device=device,
             dataloader_workers=dataloader_workers,
