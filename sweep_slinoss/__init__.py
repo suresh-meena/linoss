@@ -1,1 +1,0 @@
-"""SLinOSS sweep utilities."""
