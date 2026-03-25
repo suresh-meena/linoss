@@ -739,7 +739,7 @@ def train_torch_model(
         device=device,
         logger=logger,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.GradScaler("cuda", enabled=use_amp)
 
     running_loss = torch.zeros((), device=device, dtype=torch.float32)
     all_train_metric: list[float] = []
