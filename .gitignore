@@ -5,6 +5,7 @@ __pycache__/
 .env.local
 .remote-known-hosts
 .agent-smokes/
+.remote-state/
 remote-downloads/
 
 #Data files
