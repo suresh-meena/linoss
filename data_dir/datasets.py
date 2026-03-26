@@ -40,6 +40,41 @@ class Dataset:
     label_dim: int
 
 
+def _load_pickle(path):
+    with open(path, "rb") as handle:
+        return pickle.load(handle)
+
+
+def _load_numpy_array(path, *, dtype=None):
+    array = np.asarray(_load_pickle(path))
+    if dtype is not None:
+        array = array.astype(dtype, copy=False)
+    return np.ascontiguousarray(array)
+
+
+def _load_jax_array(path, *, dtype=None):
+    return jnp.asarray(_load_numpy_array(path, dtype=dtype))
+
+
+def _load_jax_index_splits(path):
+    return tuple(
+        jnp.asarray(np.asarray(indices, dtype=np.int64))
+        for indices in _load_pickle(path)
+    )
+
+
+def _identity(value):
+    return value
+
+
+def _numpy_array(value):
+    return np.array(value)
+
+
+def _jax_array(value):
+    return jnp.array(value)
+
+
 def batch_calc_paths(data, stepsize, depth, inmemory=True):
     N = len(data)
     batchsize = 128
@@ -47,11 +82,11 @@ def batch_calc_paths(data, stepsize, depth, inmemory=True):
     remainder = N % batchsize
     path_data = []
     if inmemory:
-        out_func = lambda x: x
-        in_func = lambda x: x
+        out_func = _identity
+        in_func = _identity
     else:
-        out_func = lambda x: np.array(x)
-        in_func = lambda x: jnp.array(x)
+        out_func = _numpy_array
+        in_func = _jax_array
     for i in range(num_batches):
         path_data.append(
             out_func(
@@ -78,11 +113,11 @@ def batch_calc_coeffs(data, include_time, T, inmemory=True):
     remainder = N % batchsize
     coeffs = []
     if inmemory:
-        out_func = lambda x: x
-        in_func = lambda x: x
+        out_func = _identity
+        in_func = _identity
     else:
-        out_func = lambda x: np.array(x)
-        in_func = lambda x: jnp.array(x)
+        out_func = _numpy_array
+        in_func = _jax_array
     for i in range(num_batches):
         coeffs.append(
             out_func(
@@ -245,21 +280,23 @@ def create_uea_dataset(
     *,
     key,
 ):
-
     if use_presplit:
         idxs = None
-        with open(data_dir + f"/processed/UEA/{name}/X_train.pkl", "rb") as f:
-            train_data = pickle.load(f)
-        with open(data_dir + f"/processed/UEA/{name}/y_train.pkl", "rb") as f:
-            train_labels = pickle.load(f)
-        with open(data_dir + f"/processed/UEA/{name}/X_val.pkl", "rb") as f:
-            val_data = pickle.load(f)
-        with open(data_dir + f"/processed/UEA/{name}/y_val.pkl", "rb") as f:
-            val_labels = pickle.load(f)
-        with open(data_dir + f"/processed/UEA/{name}/X_test.pkl", "rb") as f:
-            test_data = pickle.load(f)
-        with open(data_dir + f"/processed/UEA/{name}/y_test.pkl", "rb") as f:
-            test_labels = pickle.load(f)
+        train_data = _load_jax_array(
+            data_dir + f"/processed/UEA/{name}/X_train.pkl",
+            dtype=np.float32,
+        )
+        train_labels = _load_jax_array(data_dir + f"/processed/UEA/{name}/y_train.pkl")
+        val_data = _load_jax_array(
+            data_dir + f"/processed/UEA/{name}/X_val.pkl",
+            dtype=np.float32,
+        )
+        val_labels = _load_jax_array(data_dir + f"/processed/UEA/{name}/y_val.pkl")
+        test_data = _load_jax_array(
+            data_dir + f"/processed/UEA/{name}/X_test.pkl",
+            dtype=np.float32,
+        )
+        test_labels = _load_jax_array(data_dir + f"/processed/UEA/{name}/y_test.pkl")
         if include_time:
             ts = (T / train_data.shape[1]) * jnp.repeat(
                 jnp.arange(train_data.shape[1])[None, :], train_data.shape[0], axis=0
@@ -276,15 +313,18 @@ def create_uea_dataset(
         data = (train_data, val_data, test_data)
         onehot_labels = (train_labels, val_labels, test_labels)
     else:
-        with open(data_dir + f"/processed/UEA/{name}/data.pkl", "rb") as f:
-            data = pickle.load(f)
-        with open(data_dir + f"/processed/UEA/{name}/labels.pkl", "rb") as f:
-            labels = pickle.load(f)
+        data = _load_jax_array(
+            data_dir + f"/processed/UEA/{name}/data.pkl", dtype=np.float32
+        )
+        labels = _load_jax_array(
+            data_dir + f"/processed/UEA/{name}/labels.pkl", dtype=np.int64
+        )
         onehot_labels = jnp.zeros((len(labels), len(jnp.unique(labels))))
         onehot_labels = onehot_labels.at[jnp.arange(len(labels)), labels].set(1)
         if use_idxs:
-            with open(data_dir + f"/processed/UEA/{name}/original_idxs.pkl", "rb") as f:
-                idxs = pickle.load(f)
+            idxs = _load_jax_index_splits(
+                data_dir + f"/processed/UEA/{name}/original_idxs.pkl"
+            )
         else:
             idxs = None
 

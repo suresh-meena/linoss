@@ -29,6 +29,14 @@ def _load_pickle(path: str):
         return pickle.load(handle)
 
 
+def _load_array_pickle(path: str, *, dtype=None) -> np.ndarray:
+    """Loads processed arrays via NumPy, regardless of legacy pickle backing type."""
+    array = np.asarray(_load_pickle(path))
+    if dtype is not None:
+        array = array.astype(dtype, copy=False)
+    return np.ascontiguousarray(array)
+
+
 def _prepend_time_channel(data: np.ndarray, T: float) -> np.ndarray:
     timesteps = data.shape[1]
     ts = (T / timesteps) * np.broadcast_to(
@@ -88,25 +96,22 @@ def _load_presplit_uea_dataset(
         )
 
     train_data = np.asarray(
-        _load_pickle(os.path.join(base, "X_train.pkl")),
-        dtype=np.float32,
+        _load_array_pickle(os.path.join(base, "X_train.pkl"), dtype=np.float32),
     )
     val_data = np.asarray(
-        _load_pickle(os.path.join(base, "X_val.pkl")),
-        dtype=np.float32,
+        _load_array_pickle(os.path.join(base, "X_val.pkl"), dtype=np.float32),
     )
     test_data = np.asarray(
-        _load_pickle(os.path.join(base, "X_test.pkl")),
-        dtype=np.float32,
+        _load_array_pickle(os.path.join(base, "X_test.pkl"), dtype=np.float32),
     )
     train_labels, train_label_dim = _labels_to_indices(
-        _load_pickle(os.path.join(base, "y_train.pkl"))
+        _load_array_pickle(os.path.join(base, "y_train.pkl"))
     )
     val_labels, val_label_dim = _labels_to_indices(
-        _load_pickle(os.path.join(base, "y_val.pkl"))
+        _load_array_pickle(os.path.join(base, "y_val.pkl"))
     )
     test_labels, test_label_dim = _labels_to_indices(
-        _load_pickle(os.path.join(base, "y_test.pkl"))
+        _load_array_pickle(os.path.join(base, "y_test.pkl"))
     )
 
     if include_time:
@@ -153,9 +158,9 @@ def _load_random_split_uea_dataset(
         return bool(indices.min() >= 0 and indices.max() < size)
 
     base = os.path.join(data_dir, "processed", "UEA", name)
-    data = np.asarray(_load_pickle(os.path.join(base, "data.pkl")), dtype=np.float32)
+    data = _load_array_pickle(os.path.join(base, "data.pkl"), dtype=np.float32)
     labels, label_dim = _labels_to_indices(
-        _load_pickle(os.path.join(base, "labels.pkl"))
+        _load_array_pickle(os.path.join(base, "labels.pkl"))
     )
     if include_time:
         data = _prepend_time_channel(data, T)

@@ -51,14 +51,27 @@ processed/{collection}/{dataset_name}/data.pkl,
 processed/{collection}/{dataset_name}/labels.pkl,
 processed/{collection}/{dataset_name}/original_idxs.pkl (if the dataset has original data splits)
 ```
-where data.pkl and labels.pkl are jnp.arrays with shape (n_samples, n_timesteps, n_features) 
-and (n_samples, n_classes) respectively. If the dataset had original_idxs then those should
-be saved as a list of jnp.arrays with shape [(n_train,), (n_val,), (n_test,)].
+where `data.pkl` and `labels.pkl` are NumPy arrays with shape `(n_samples, n_timesteps, n_features)`
+and `(n_samples,)` respectively. If the dataset had `original_idxs` then those should
+be saved as NumPy integer arrays inside a tuple or list.
 
 ### The UEA Datasets
 
 The UEA datasets are a collection of multivariate time series classification benchmarks. They can be downloaded by 
 running `data_dir/download_uea.py` and preprocessed by running `data_dir/process_uea.py`.
+
+The authoritative processed UEA format is now NumPy-backed pickle files. If you have an older processed tree that
+was written with JAX arrays, rewrite it in place with:
+
+```bash
+python data_dir/process_uea.py --data-dir data_dir --rewrite-existing
+```
+
+If you want to regenerate the processed UEA tree from raw ARFF files instead, use:
+
+```bash
+python data_dir/process_uea.py --data-dir data_dir --overwrite
+```
 
 ### The PPG-DaLiA Dataset
 
