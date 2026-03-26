@@ -11,6 +11,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Mapping, TextIO
 
+# Keep JAX/XLA off the GPU in the Torch SLinOSS path. The processed UEA pickles
+# contain JAX arrays, so unpickling them can otherwise trigger JAX GPU runtime
+# initialization and large non-PyTorch allocations in sweep workers.
+os.environ["JAX_PLATFORMS"] = "cpu"
+os.environ["JAX_PLATFORM_NAME"] = "cpu"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 import numpy as np
 import torch
 from torch.nn import functional as F
