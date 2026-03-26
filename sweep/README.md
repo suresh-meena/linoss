@@ -81,7 +81,7 @@ Preview only the trials assigned to one hardware tier:
 ```bash
 python -m sweep plan \
   --config sweep/configs/slinoss_uea_grid.json \
-  --resource-tier rtx3050-8gb
+  --resource-tier rtx3050-6gb
 ```
 
 Run one quarter of the work on the first two GPUs of a machine:

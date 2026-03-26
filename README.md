@@ -123,11 +123,16 @@ The hardware split is not baked into the hyperparameter grid itself. It is expre
 
 ### Hardware Tiers
 
-The checked-in resource profile currently defines two execution tiers:
+The checked-in resource profile currently defines two execution tiers. On March
+26, 2026, I reran the full `108` unique config rows on the remote 3090 box with
+a conservative `5.5 GiB` per-process cap to emulate the actual RTX 3050 `6 GB`
+fleet. That recalibration reproduced the same `18` ADA-only rows as the earlier
+draft, so the split below is now confirmed for `6 GB` cards rather than carried
+over from the old `8 GB` planning assumption.
 
 | Resource tier | Intended hardware | Trials | Groups after filtering | Purpose |
 | --- | --- | ---: | ---: | --- |
-| `rtx3050-8gb` | RTX 3050 8 GB fleet | 1350 | 60 | Default tier for everything that probed cleanly under the LinOSS-faithful batch sizes |
+| `rtx3050-6gb` | RTX 3050 6 GB fleet | 1350 | 60 | Default tier for everything that probed cleanly under the LinOSS-faithful batch sizes |
 | `ada6000` | RTX ADA 6000 | 270 | 40 | Deep-family rows that OOMed on the probe box under the LinOSS-faithful batch sizes |
 
 The ADA-only rows are:
@@ -170,14 +175,14 @@ Each machine also needs the processed datasets under `data_dir/processed/UEA/...
 
 ```bash
 python -m sweep plan --config sweep/configs/slinoss_uea_grid.json
-python -m sweep plan --config sweep/configs/slinoss_uea_grid.json --resource-tier rtx3050-8gb
+python -m sweep plan --config sweep/configs/slinoss_uea_grid.json --resource-tier rtx3050-6gb
 python -m sweep plan --config sweep/configs/slinoss_uea_grid.json --resource-tier ada6000
 ```
 
 This should report:
 
 - full plan: `1620` trials across `60` groups
-- `rtx3050-8gb`: `1350` trials across `60` filtered groups
+- `rtx3050-6gb`: `1350` trials across `60` filtered groups
 - `ada6000`: `270` trials across `40` filtered groups
 
 3. Keep a tiny shared ledger outside the repo.
@@ -202,7 +207,7 @@ Example: first 3050 machine:
 ```bash
 python -m sweep run \
   --config sweep/configs/slinoss_uea_grid.json \
-  --resource-tier rtx3050-8gb \
+  --resource-tier rtx3050-6gb \
   --devices cuda:0 \
   --shard 1/16
 ```
@@ -212,7 +217,7 @@ Second 3050 machine:
 ```bash
 python -m sweep run \
   --config sweep/configs/slinoss_uea_grid.json \
-  --resource-tier rtx3050-8gb \
+  --resource-tier rtx3050-6gb \
   --devices cuda:0 \
   --shard 2/16
 ```
@@ -242,7 +247,7 @@ If a machine has multiple GPUs, either pass them together:
 ```bash
 python -m sweep run \
   --config sweep/configs/slinoss_uea_grid.json \
-  --resource-tier rtx3050-8gb \
+  --resource-tier rtx3050-6gb \
   --devices cuda:0,cuda:1 \
   --shard 3/16
 ```
@@ -282,7 +287,18 @@ The important artifacts are:
 
 ### Probe-Based Budget And Placement Estimates
 
-The timing probes were run with the new SLinOSS path in strict FP32, with `torch.compile` disabled, mixed precision disabled, `5` warmup steps, and `20` timed training steps per configuration. The timing numbers below use the raw probe timings as conservative planning inputs. They are not direct RTX 3050 benchmarks, but they were measured on a remote 3090 box that, on a matched calibration case, was slower than the local 3060 run for this code path.
+The timing probes were run with the new SLinOSS path in strict FP32, with
+`torch.compile` disabled, mixed precision disabled, `5` warmup steps, and `20`
+timed training steps per configuration. The timing numbers below use the raw
+probe timings as conservative planning inputs. They are not direct RTX 3050
+benchmarks, but they were measured on a remote 3090 box that, on a matched
+calibration case, was slower than the local 3060 run for this code path.
+
+The same March 26, 2026 rerun also reapplied a `5.5 GiB` cap to the full
+`108`-row calibration table to mimic the real RTX 3050 `6 GB` cards. That pass
+confirmed that the `6 GB` fleet uses the same placement boundary as the earlier
+draft, so the trial counts and budget tables below are unchanged apart from the
+updated tier name.
 
 The ADA-only rows also OOMed on the 24 GB probe box under the exact LinOSS-faithful batch sizes. Their runtime budget is therefore an upper bound derived from smaller-batch safe probes for the same rows. In practice, the ADA 6000 should be strictly better than this bound.
 

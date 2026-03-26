@@ -11,7 +11,7 @@ def _write_config(path, *, output_root: str) -> None:
     resource_profile_path.write_text(
         json.dumps(
             {
-                "default_tier": "rtx3050-8gb",
+                "default_tier": "rtx3050-6gb",
                 "rules": [
                     {
                         "match": {

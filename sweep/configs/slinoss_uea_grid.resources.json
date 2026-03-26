@@ -1,5 +1,5 @@
 {
-  "default_tier": "rtx3050-8gb",
+  "default_tier": "rtx3050-6gb",
   "rules": [
     {
       "match": {"dataset_name": "EigenWorms", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 4, "batch_size": 4},

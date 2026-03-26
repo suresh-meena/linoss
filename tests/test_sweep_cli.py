@@ -12,7 +12,7 @@ def test_sweep_plan_cli_smoke(tmp_path) -> None:
     resource_profile_path.write_text(
         json.dumps(
             {
-                "default_tier": "rtx3050-8gb",
+                "default_tier": "rtx3050-6gb",
                 "rules": [
                     {
                         "match": {
