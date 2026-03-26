@@ -123,6 +123,24 @@ Reduce finished trials into a family leaderboard:
 python -m sweep reduce --config sweep/configs/slinoss_uea_grid.example.json
 ```
 
+## Remote Fleet Control
+
+The intended remote operating model lives one layer up in `scripts/`. Use the
+remote wrappers to keep the CuTe-safe single-visible-GPU pattern automatic and
+to centralize collected results under `.remote-state/`.
+
+Typical control flow:
+
+```bash
+./scripts/remote-gpu-status --group 3050 --require-idle --min-free-vram-gib 4.5
+./scripts/remote-sweep-run --machine opb7 --gpu 0 --config sweep/configs/slinoss_uea_grid.json --resource-tier rtx3050-6gb --shard 7/18
+./scripts/remote-collect --group 3050 --sweep slinoss-uea-grid
+./scripts/remote-sweep-status --config sweep/configs/slinoss_uea_grid.json
+```
+
+Do not run one sweep process with `--devices cuda:0,cuda:1`. Keep one visible
+physical GPU per process and `--devices cuda:0` inside the process.
+
 ## Output Structure
 
 For a sweep rooted at `outputs/sweeps/slinoss-uea-grid`, the package writes:

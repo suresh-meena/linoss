@@ -148,30 +148,61 @@ The ADA-only rows are:
 
 Counting both `include_time=false/true`, that is `18` ADA-only config rows or `270` trials.
 
-### Manual Multi-Machine Workflow
+### Remote Fleet Workflow
 
-The intended operating model is deliberately simple: no master process, no distributed scheduler, no worker coordinator. Each machine claims one or more deterministic shards and runs them locally.
+The intended operating model is still deliberately simple: no scheduler, no
+worker coordinator, no master process. One control checkout manages many
+machines through `scripts/remotectl.py`, and every remote worker still runs a
+deterministic `python -m sweep run ...` shard locally.
 
-1. Prepare each machine:
+The control checkout keeps its centralized state in the ignored
+`.remote-state/` directory:
+
+- `.remote-state/fleet-state.json`
+  last-known smoke, setup, GPU, collect, and launch data per machine
+- `.remote-state/sweeps/<name>/ledger.jsonl`
+  append-only launch and collect events
+- `.remote-state/sweeps/<name>/machines/<machine>/`
+  per-machine collected result snapshots
+- `.remote-state/sweeps/<name>/canonical/`
+  merged result tree used to answer exact completion questions
+
+That centralized cache is how an agent can later answer “what is complete,
+what is still pending, and which trials are done?” without inventing a
+scheduler or reverse-engineering random marker files.
+
+1. Populate the root `.env` with machine groups and GPU metadata.
+
+The remote helpers read:
+
+- `KD_REMOTE_GROUP_3050=opb1,...,opb18`
+- `KD_REMOTE_GROUP_ADA=ada1,ada2`
+- `KD_REMOTE_<MACHINE>_GPU_CLASS=...`
+- `KD_REMOTE_<MACHINE>_GPU_VRAM_GIB=...`
+- `KD_REMOTE_<MACHINE>_GPU_COUNT=...`
+
+Useful sanity checks:
 
 ```bash
-git clone <repo-url>
-cd linoss
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
+./scripts/remote-list --groups
+./scripts/remote-list --group 3050 --verbose
+./scripts/remote-print-config --group 3050
 ```
 
-Optional bootstrap for Guix-managed machines:
+2. Bootstrap each group from the control checkout.
+
+`remote-smoke` now fails hard if the configured `WORKDIR` is missing. `remote-setup`
+creates that workdir, syncs the repo, and builds the remote `.venv`.
 
 ```bash
-guix shell -m manifest.scm
+./scripts/remote-smoke --group 3050
+./scripts/remote-setup --group 3050 --check-path data_dir/processed/UEA
+
+./scripts/remote-smoke --group ada
+./scripts/remote-setup --group ada --check-path data_dir/processed/UEA
 ```
 
-Each machine also needs the processed datasets under `data_dir/processed/UEA/...`.
-
-2. Materialize the plan once:
+3. Materialize the plan once and keep the shard pools separate by tier.
 
 ```bash
 python -m sweep plan --config sweep/configs/slinoss_uea_grid.json
@@ -185,112 +216,109 @@ This should report:
 - `rtx3050-6gb`: `1350` trials across `60` filtered groups
 - `ada6000`: `270` trials across `40` filtered groups
 
-3. Keep a tiny shared ledger outside the repo.
+`--shard` is applied after resource-tier filtering, so the 3050 and ADA pools
+can be managed independently.
 
-The minimal useful columns are:
+4. Choose targets politely before launching.
 
-- `machine`
-- `gpu`
-- `resource_tier`
-- `shard`
-- `started_at`
-- `finished_at`
-- `status`
-- `notes`
+The policy is:
 
-4. Run the 3050 fleet and ADA machines as separate shard pools.
+- do not take a GPU with an active compute process
+- do not take a GPU whose free VRAM is below the intended tier requirement
+- do not ignore active lease files unless you are deliberately preempting stale state
 
-`--shard` is applied after dataset and resource-tier filtering, so the 3050 and ADA pools can be managed independently.
-
-Example: first 3050 machine:
+Examples:
 
 ```bash
-python -m sweep run \
+./scripts/remote-gpu-status --group 3050 --require-idle --min-free-vram-gib 4.5
+./scripts/remote-gpu-status --group ada --require-idle --min-free-vram-gib 16
+```
+
+5. Launch detached remote workers through `remote-sweep-run`.
+
+This wrapper enforces the CuTe-safe single-visible-GPU pattern automatically:
+it always runs one remote process with `CUDA_VISIBLE_DEVICES=<physical_gpu>` and
+`--devices cuda:0` inside the process.
+
+3050 example:
+
+```bash
+./scripts/remote-sweep-run \
+  --machine opb7 \
+  --gpu 0 \
   --config sweep/configs/slinoss_uea_grid.json \
   --resource-tier rtx3050-6gb \
-  --devices cuda:0 \
-  --shard 1/16
+  --shard 7/18 \
+  --require-idle \
+  --min-free-vram-gib 4.5 \
+  --note "3050 shard 7/18"
 ```
 
-Second 3050 machine:
+ADA example:
 
 ```bash
-python -m sweep run \
+./scripts/remote-sweep-run \
+  --machine ada \
+  --gpu 0 \
+  --config sweep/configs/slinoss_uea_grid.json \
+  --resource-tier ada6000 \
+  --shard 1/2 \
+  --require-idle \
+  --min-free-vram-gib 16 \
+  --note "ada shard 1/2"
+```
+
+If you want to inspect the exact SSH and remote launch command first:
+
+```bash
+./scripts/remote-sweep-run \
+  --machine opb7 \
+  --gpu 0 \
   --config sweep/configs/slinoss_uea_grid.json \
   --resource-tier rtx3050-6gb \
-  --devices cuda:0 \
-  --shard 2/16
-```
-
-First ADA machine:
-
-```bash
-python -m sweep run \
-  --config sweep/configs/slinoss_uea_grid.json \
-  --resource-tier ada6000 \
-  --devices cuda:0 \
-  --shard 1/2
-```
-
-Second ADA machine:
-
-```bash
-python -m sweep run \
-  --config sweep/configs/slinoss_uea_grid.json \
-  --resource-tier ada6000 \
-  --devices cuda:0 \
-  --shard 2/2
+  --shard 7/18 \
+  --dry-run
 ```
 
 On multi-GPU machines, do not pass non-zero logical CUDA devices like
-`--devices cuda:0,cuda:1` to one sweep process right now. The current CuTe /
-CUTLASS DSL stack can crash on logical devices such as `cuda:1` when multiple
-GPUs are visible. The safe pattern is one process per physical GPU, with only
-that GPU visible to the process, and `--devices cuda:0` inside the process.
+`--devices cuda:0,cuda:1` to one sweep process. The current CuTe / CUTLASS DSL
+stack can still crash on logical devices such as `cuda:1` when multiple GPUs
+are visible. The safe pattern is one process per physical GPU, one visible GPU
+per process, and `--devices cuda:0` inside that process. `remote-sweep-run`
+exists specifically to keep that rule automatic.
+
+6. Collect results back into the centralized cache.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python -m sweep run \
-  --config sweep/configs/slinoss_uea_grid.json \
-  --resource-tier rtx3050-6gb \
-  --devices cuda:0 \
-  --shard 3/16
+./scripts/remote-collect --group 3050 --sweep slinoss-uea-grid
+./scripts/remote-collect --group ada --sweep slinoss-uea-grid
 ```
+
+`remote-collect` stores each machine snapshot under
+`.remote-state/sweeps/slinoss-uea-grid/machines/<machine>/` and also merges it
+into `.remote-state/sweeps/slinoss-uea-grid/canonical/`.
+
+7. Ask for exact completion status from the merged cache.
 
 ```bash
-CUDA_VISIBLE_DEVICES=1 python -m sweep run \
-  --config sweep/configs/slinoss_uea_grid.json \
-  --resource-tier rtx3050-6gb \
-  --devices cuda:0 \
-  --shard 4/16
+./scripts/remote-sweep-status --config sweep/configs/slinoss_uea_grid.json
+./scripts/remote-sweep-status --config sweep/configs/slinoss_uea_grid.json --list pending
+./scripts/remote-sweep-status --config sweep/configs/slinoss_uea_grid.json --list failed
 ```
 
-Use the same pattern on larger boxes: one shell per GPU, set
-`CUDA_VISIBLE_DEVICES` to a single physical GPU ordinal, then run the sweep
-worker with `--devices cuda:0`.
+This compares the deterministic plan against the canonical collected
+`result.json` files, so it answers both “how much is done?” and “which specific
+trials are still pending?”.
 
-Useful selection variants:
-
-```bash
-python -m sweep plan --config sweep/configs/slinoss_uea_grid.json --dataset MotorImagery
-python -m sweep plan --config sweep/configs/slinoss_uea_grid.json --dataset MotorImagery --resource-tier ada6000
-python -m sweep run --config sweep/configs/slinoss_uea_grid.json --devices cuda:0 --dataset MotorImagery --resource-tier ada6000 --shard 1/2
-```
-
-5. Resume or retry safely.
+8. Resume or retry safely.
 
 - Completed trials are skipped automatically.
 - Use `--retry-failed` to rerun only failed trials.
 - Use `--force` only when you intentionally want to replace existing outputs.
 
-6. Aggregate results after the shards finish.
+9. Reduce once the collected canonical tree is complete enough.
 
-Rsync each machine's `outputs/sweeps/slinoss-uea-grid/` tree back into one canonical copy, then reduce:
-
-```bash
-python -m sweep reduce --config sweep/configs/slinoss_uea_grid.json
-```
-
-The important artifacts are:
+The remote workers already emit:
 
 - `manifest.json`
 - `plan.jsonl`
@@ -298,6 +326,16 @@ The important artifacts are:
 - `trials/**/result.json`
 - `reports/family_summary.json`
 - `reports/family_summary.csv`
+
+The centralized cache mirrors those files under
+`.remote-state/sweeps/<name>/canonical/`. The existing `python -m sweep reduce`
+command still reduces from `outputs/sweeps/<name>/`, so first mirror the
+canonical cache into that local output root:
+
+```bash
+rsync -a .remote-state/sweeps/slinoss-uea-grid/canonical/ outputs/sweeps/slinoss-uea-grid/
+python -m sweep reduce --config sweep/configs/slinoss_uea_grid.json
+```
 
 ### Probe-Based Budget And Placement Estimates
 
