@@ -1,6 +1,10 @@
 .venv/
 __pycache__/
 *.pyc
+.env
+.env.local
+.remote-known-hosts
+remote-downloads/
 
 #Data files
 data_dir/raw/
