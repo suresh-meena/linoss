@@ -16,6 +16,6 @@ scipy==1.17.1
 signax==0.1.1
 # Match the published slinoss CUDA release wheel for Linux x86_64 / CPython 3.11.
 torch==2.10.0
-slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.1.1/slinoss-0.1.1-cp311-cp311-linux_x86_64.whl#sha256=d4695242e1b3805408870a7c7b48d7be404a45b7edbf81f599ceee5850d7a980
+slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.2.0/slinoss-0.2.0-cp311-cp311-linux_x86_64.whl#sha256=c3211efe8e30c5c54d9179857834c59215f7a5b4a0174cdf0ead707c922cb4b8
 sktime==0.30.1
 tqdm==4.66.4

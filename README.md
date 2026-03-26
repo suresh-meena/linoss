@@ -119,7 +119,7 @@ The rest of the grid is:
 
 The hardware split is not baked into the hyperparameter grid itself. It is expressed separately in `sweep/configs/slinoss_uea_grid.resources.json`, and the CLI can filter by that resource tier with `--resource-tier`.
 
-Before running a long production sweep, update `requirements.txt` to the first `slinoss` release that includes the upstream eval / `torch.no_grad()` fix from issue `#6`. The sweep code is ready now; the currently pinned `v0.1.1` wheel is not the release I would use for a multi-day production run.
+`requirements.txt` now pins `slinoss v0.2.0`, which includes the upstream eval / `torch.no_grad()` fix from issue `#6`. That is the release this sweep stack is intended to run against.
 
 ### Hardware Tiers
 
