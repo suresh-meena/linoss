@@ -242,17 +242,31 @@ python -m sweep run \
   --shard 2/2
 ```
 
-If a machine has multiple GPUs, either pass them together:
+On multi-GPU machines, do not pass non-zero logical CUDA devices like
+`--devices cuda:0,cuda:1` to one sweep process right now. The current CuTe /
+CUTLASS DSL stack can crash on logical devices such as `cuda:1` when multiple
+GPUs are visible. The safe pattern is one process per physical GPU, with only
+that GPU visible to the process, and `--devices cuda:0` inside the process.
 
 ```bash
-python -m sweep run \
+CUDA_VISIBLE_DEVICES=0 python -m sweep run \
   --config sweep/configs/slinoss_uea_grid.json \
   --resource-tier rtx3050-6gb \
-  --devices cuda:0,cuda:1 \
+  --devices cuda:0 \
   --shard 3/16
 ```
 
-or run one process per GPU with different shards.
+```bash
+CUDA_VISIBLE_DEVICES=1 python -m sweep run \
+  --config sweep/configs/slinoss_uea_grid.json \
+  --resource-tier rtx3050-6gb \
+  --devices cuda:0 \
+  --shard 4/16
+```
+
+Use the same pattern on larger boxes: one shell per GPU, set
+`CUDA_VISIBLE_DEVICES` to a single physical GPU ordinal, then run the sweep
+worker with `--devices cuda:0`.
 
 Useful selection variants:
 

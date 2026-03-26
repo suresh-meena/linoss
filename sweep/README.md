@@ -84,21 +84,26 @@ python -m sweep plan \
   --resource-tier rtx3050-6gb
 ```
 
-Run one quarter of the work on the first two GPUs of a machine:
+On multi-GPU machines, do not pass logical devices like
+`--devices cuda:0,cuda:1` to one process right now. The current CuTe /
+CUTLASS DSL stack is reliable when each process sees exactly one GPU and uses
+`--devices cuda:0`.
+
+Run one quarter of the work on one physical GPU:
 
 ```bash
-python -m sweep run \
+CUDA_VISIBLE_DEVICES=0 python -m sweep run \
   --config sweep/configs/slinoss_uea_grid.example.json \
-  --devices cuda:0,cuda:1 \
+  --devices cuda:0 \
   --shard 1/4
 ```
 
-Run the second quarter on a different machine:
+Run the second quarter on another physical GPU:
 
 ```bash
-python -m sweep run \
+CUDA_VISIBLE_DEVICES=1 python -m sweep run \
   --config sweep/configs/slinoss_uea_grid.example.json \
-  --devices cuda:0,cuda:1 \
+  --devices cuda:0 \
   --shard 2/4
 ```
 
