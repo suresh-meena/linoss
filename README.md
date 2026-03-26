@@ -96,9 +96,14 @@ See `experiment_configs/repeats` for examples.
 
 ## Sweeps
 
-Large SLinOSS hyperparameter searches now live in `sweep/` and follow a deterministic `plan -> run -> reduce` flow. The production UEA grid is checked in at `sweep/configs/slinoss_uea_grid.json`.
+Large SLinOSS hyperparameter searches now live in `sweep/` and follow a deterministic `plan -> run -> reduce` flow. The production UEA sweep is checked in at `sweep/configs/slinoss_uea_grid.json`.
 
-That config expands to:
+That config is now fully LinOSS-faithful on batch size:
+
+- `EigenWorms`: `batch_size=4`
+- all other UEA datasets: `batch_size=32`
+
+The rest of the grid is:
 
 - 6 datasets
 - 3 model families:
@@ -109,25 +114,34 @@ That config expands to:
 - 3 layer counts: `2`, `4`, `6`
 - 3 learning rates: `1e-3`, `1e-4`, `1e-5`
 - 5 seeds: `2345`, `3456`, `4567`, `5678`, `6789`
-- total work: `1620` trials in `60` dataset-cache groups
-- one `(dataset, include_time, seed)` group contains `27` trials
+- total work: `1620` trials in `60` deterministic dataset-cache groups
+- one `(dataset, include_time, seed)` group contains `27` trials before any tier filtering
 
-The original LinOSS repeat configs use a simpler dataset-level batch policy:
-
-- `EigenWorms`: `batch_size=4`
-- all other UEA datasets: `batch_size=32`
-
-I checked that exact policy against the SLinOSS grid before changing the production config. It is not fully runnable on the intended RTX 3060 fleet, and some of the failing cases also OOM on a `24 GiB` RTX 3090. The failing rows are:
-
-- `EigenWorms`, `large`, `n_layers=4/6`
-- `EthanolConcentration`, `large`, `n_layers=4/6`
-- `MotorImagery`, `medium`, `n_layers=6`
-- `MotorImagery`, `large`, `n_layers=2/4/6`
-- `SelfRegulationSCP2`, `large`, `n_layers=6`
-
-Counting both `include_time=false/true`, that is `18` failed config rows or `270` infeasible trials out of the full `1620`. Because of that, `sweep/configs/slinoss_uea_grid.json` intentionally keeps the lower per-family batch sizes that were actually validated for the complete SLinOSS search on 3060-class hardware.
+The hardware split is not baked into the hyperparameter grid itself. It is expressed separately in `sweep/configs/slinoss_uea_grid.resources.json`, and the CLI can filter by that resource tier with `--resource-tier`.
 
 Before running a long production sweep, update `requirements.txt` to the first `slinoss` release that includes the upstream eval / `torch.no_grad()` fix from issue `#6`. The sweep code is ready now; the currently pinned `v0.1.1` wheel is not the release I would use for a multi-day production run.
+
+### Hardware Tiers
+
+The checked-in resource profile currently defines two execution tiers:
+
+| Resource tier | Intended hardware | Trials | Groups after filtering | Purpose |
+| --- | --- | ---: | ---: | --- |
+| `rtx3050-8gb` | RTX 3050 8 GB fleet | 1350 | 60 | Default tier for everything that probed cleanly under the LinOSS-faithful batch sizes |
+| `ada6000` | RTX ADA 6000 | 270 | 40 | Deep-family rows that OOMed on the probe box under the LinOSS-faithful batch sizes |
+
+The ADA-only rows are:
+
+| Dataset | 3050-safe rows | ADA-only rows |
+| --- | --- | --- |
+| `EigenWorms` | `small` all layers, `medium` all layers, `large` `n_layers=2` | `large` `n_layers=4/6` |
+| `EthanolConcentration` | `small` all layers, `medium` all layers, `large` `n_layers=2` | `large` `n_layers=4/6` |
+| `Heartbeat` | all families, all layers | none |
+| `MotorImagery` | `small` all layers, `medium` `n_layers=2/4` | `medium` `n_layers=6`, `large` `n_layers=2/4/6` |
+| `SelfRegulationSCP1` | all families, all layers | none |
+| `SelfRegulationSCP2` | `small` all layers, `medium` all layers, `large` `n_layers=2/4` | `large` `n_layers=6` |
+
+Counting both `include_time=false/true`, that is `18` ADA-only config rows or `270` trials.
 
 ### Manual Multi-Machine Workflow
 
@@ -144,7 +158,7 @@ pip install -U pip
 pip install -r requirements.txt
 ```
 
-Optional bootstrap for machines that use Guix:
+Optional bootstrap for Guix-managed machines:
 
 ```bash
 guix shell -m manifest.scm
@@ -156,67 +170,100 @@ Each machine also needs the processed datasets under `data_dir/processed/UEA/...
 
 ```bash
 python -m sweep plan --config sweep/configs/slinoss_uea_grid.json
+python -m sweep plan --config sweep/configs/slinoss_uea_grid.json --resource-tier rtx3050-8gb
+python -m sweep plan --config sweep/configs/slinoss_uea_grid.json --resource-tier ada6000
 ```
 
-This should report `1620` trials and `60` groups.
+This should report:
 
-3. Claim shards manually.
+- full plan: `1620` trials across `60` groups
+- `rtx3050-8gb`: `1350` trials across `60` filtered groups
+- `ada6000`: `270` trials across `40` filtered groups
 
-Keep a very small shared ledger outside the repo with columns like:
+3. Keep a tiny shared ledger outside the repo.
+
+The minimal useful columns are:
 
 - `machine`
 - `gpu`
+- `resource_tier`
 - `shard`
 - `started_at`
 - `finished_at`
 - `status`
 - `notes`
 
-For one-GPU RTX 3060 machines, one shard per machine is the clean default:
+4. Run the 3050 fleet and ADA machines as separate shard pools.
+
+`--shard` is applied after dataset and resource-tier filtering, so the 3050 and ADA pools can be managed independently.
+
+Example: first 3050 machine:
 
 ```bash
 python -m sweep run \
   --config sweep/configs/slinoss_uea_grid.json \
+  --resource-tier rtx3050-8gb \
   --devices cuda:0 \
-  --shard 1/8
+  --shard 1/16
 ```
 
-On the next machine:
+Second 3050 machine:
 
 ```bash
 python -m sweep run \
   --config sweep/configs/slinoss_uea_grid.json \
+  --resource-tier rtx3050-8gb \
   --devices cuda:0 \
-  --shard 2/8
+  --shard 2/16
 ```
 
-And so on.
+First ADA machine:
+
+```bash
+python -m sweep run \
+  --config sweep/configs/slinoss_uea_grid.json \
+  --resource-tier ada6000 \
+  --devices cuda:0 \
+  --shard 1/2
+```
+
+Second ADA machine:
+
+```bash
+python -m sweep run \
+  --config sweep/configs/slinoss_uea_grid.json \
+  --resource-tier ada6000 \
+  --devices cuda:0 \
+  --shard 2/2
+```
 
 If a machine has multiple GPUs, either pass them together:
 
 ```bash
 python -m sweep run \
   --config sweep/configs/slinoss_uea_grid.json \
+  --resource-tier rtx3050-8gb \
   --devices cuda:0,cuda:1 \
-  --shard 3/8
+  --shard 3/16
 ```
 
-or run one process per GPU with different shards. Because sharding happens over deterministic groups, machines do not need to know about each other.
+or run one process per GPU with different shards.
 
 Useful selection variants:
 
 ```bash
 python -m sweep plan --config sweep/configs/slinoss_uea_grid.json --dataset MotorImagery
-python -m sweep run --config sweep/configs/slinoss_uea_grid.json --devices cuda:0 --dataset MotorImagery --shard 1/2
+python -m sweep plan --config sweep/configs/slinoss_uea_grid.json --dataset MotorImagery --resource-tier ada6000
+python -m sweep run --config sweep/configs/slinoss_uea_grid.json --devices cuda:0 --dataset MotorImagery --resource-tier ada6000 --shard 1/2
 ```
 
-4. Resume or retry safely.
+5. Resume or retry safely.
 
 - Completed trials are skipped automatically.
 - Use `--retry-failed` to rerun only failed trials.
 - Use `--force` only when you intentionally want to replace existing outputs.
 
-5. Aggregate results after the shards finish.
+6. Aggregate results after the shards finish.
 
 Rsync each machine's `outputs/sweeps/slinoss-uea-grid/` tree back into one canonical copy, then reduce:
 
@@ -233,72 +280,55 @@ The important artifacts are:
 - `reports/family_summary.json`
 - `reports/family_summary.csv`
 
-### Probe-Based Budget And VRAM
+### Probe-Based Budget And Placement Estimates
 
-The tables below were measured with the new SLinOSS path in strict FP32, with `torch.compile` disabled, mixed precision disabled, `5` warmup steps, and `20` timed training steps per configuration. The initial batch search was then corrected with targeted reruns for the three deep-family cases that still needed smaller batch sizes.
+The timing probes were run with the new SLinOSS path in strict FP32, with `torch.compile` disabled, mixed precision disabled, `5` warmup steps, and `20` timed training steps per configuration. The timing numbers below use the raw probe timings as conservative planning inputs. They are not direct RTX 3050 benchmarks, but they were measured on a remote 3090 box that, on a matched calibration case, was slower than the local 3060 run for this code path.
 
-One matched calibration case (`Heartbeat`, `small`, `batch_size=2`, `include_time=true`, `n_layers=2`) ran at `26.46 sec / 1000 steps` on the remote RTX 3090 probe box and `8.83 sec / 1000 steps` on the local RTX 3060. In other words, the remote box is currently slower than the local 3060 for this exact code path. The timing tables below therefore use the raw probe timings as conservative planning numbers for 3060-class machines, rather than scaling them down aggressively.
+The ADA-only rows also OOMed on the 24 GB probe box under the exact LinOSS-faithful batch sizes. Their runtime budget is therefore an upper bound derived from smaller-batch safe probes for the same rows. In practice, the ADA 6000 should be strictly better than this bound.
 
-Safe batch sizes and measured peak reserved VRAM for the full `20`-step probe:
+Per-dataset split and budget:
 
-| Dataset | Shape | Small batch / peak GiB | Medium batch / peak GiB | Large batch / peak GiB |
-| --- | --- | ---: | ---: | ---: |
-| EigenWorms | `236 x 17984 x 6` | 8 / 3.27 | 2 / 2.50 | 1 / 4.53 |
-| EthanolConcentration | `524 x 1751 x 3` | 32 / 1.32 | 32 / 3.81 | 8 / 2.80 |
-| Heartbeat | `409 x 405 x 61` | 32 / 1.08 | 32 / 1.68 | 32 / 3.39 |
-| MotorImagery | `378 x 3000 x 64` | 32 / 2.45 | 16 / 3.58 | 8 / 5.29 |
-| SelfRegulationSCP1 | `561 x 896 x 6` | 32 / 0.65 | 32 / 1.98 | 16 / 2.66 |
-| SelfRegulationSCP2 | `380 x 1152 x 7` | 32 / 1.34 | 32 / 2.99 | 16 / 4.09 |
+| Dataset | 3050 trials | ADA trials | 3050 expected GPU-h | 3050 conservative GPU-h | ADA expected upper GPU-h | ADA conservative upper GPU-h |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| EigenWorms | 210 | 60 | 62.0 | 82.7 | 20.0 | 26.6 |
+| EthanolConcentration | 210 | 60 | 45.9 | 61.2 | 15.4 | 20.6 |
+| Heartbeat | 270 | 0 | 45.2 | 60.3 | 0.0 | 0.0 |
+| MotorImagery | 150 | 120 | 36.1 | 48.2 | 43.6 | 58.2 |
+| SelfRegulationSCP1 | 270 | 0 | 67.4 | 89.9 | 0.0 | 0.0 |
+| SelfRegulationSCP2 | 240 | 30 | 55.4 | 73.8 | 11.8 | 15.7 |
+| Total | 1350 | 270 | 312.1 | 416.1 | 90.8 | 121.1 |
 
-Estimated full-budget runtime per trial at `20k` steps, in minutes. Each cell is `include_time=false / include_time=true`.
+Interpretation:
 
-| Dataset | Family | Batch | Peak GiB | 20k min/trial n=2 (off/on) | 20k min/trial n=4 (off/on) | 20k min/trial n=6 (off/on) |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| EigenWorms | small | 8 | 4.44 | 11.2 / 10.7 | 21.4 / 20.9 | 31.3 / 31.1 |
-| EigenWorms | medium | 2 | 2.50 | 9.0 / 9.2 | 16.0 / 15.9 | 23.5 / 23.4 |
-| EigenWorms | large | 1 | 4.53 | 11.0 / 11.0 | 21.3 / 21.5 | 31.7 / 31.7 |
-| EthanolConcentration | small | 32 | 2.22 | 4.4 / 4.4 | 8.3 / 8.3 | 12.2 / 12.3 |
-| EthanolConcentration | medium | 32 | 4.56 | 11.0 / 10.8 | 21.1 / 21.5 | 31.3 / 31.5 |
-| EthanolConcentration | large | 8 | 2.80 | 10.7 / 10.2 | 17.0 / 16.9 | 24.1 / 24.4 |
-| Heartbeat | small | 32 | 1.41 | 9.1 / 9.0 | 13.3 / 13.6 | 14.0 / 13.5 |
-| Heartbeat | medium | 32 | 1.88 | 8.2 / 8.9 | 13.0 / 13.4 | 13.7 / 14.3 |
-| Heartbeat | large | 32 | 3.39 | 10.4 / 10.2 | 15.8 / 16.1 | 22.3 / 22.6 |
-| MotorImagery | small | 32 | 3.21 | 6.8 / 8.8 | 13.3 / 14.2 | 20.5 / 19.7 |
-| MotorImagery | medium | 16 | 4.21 | 9.5 / 10.2 | 18.5 / 18.9 | 27.4 / 27.7 |
-| MotorImagery | large | 8 | 5.29 | 15.3 / 15.1 | 29.8 / 29.9 | 43.8 / 43.7 |
-| SelfRegulationSCP1 | small | 32 | 1.56 | 8.5 / 8.5 | 13.5 / 13.4 | 14.4 / 12.7 |
-| SelfRegulationSCP1 | medium | 32 | 2.85 | 9.4 / 9.4 | 14.0 / 14.2 | 17.1 / 17.2 |
-| SelfRegulationSCP1 | large | 16 | 2.66 | 8.2 / 9.1 | 17.2 / 16.8 | 23.9 / 24.1 |
-| SelfRegulationSCP2 | small | 32 | 1.76 | 8.6 / 8.7 | 13.3 / 13.1 | 13.3 / 13.6 |
-| SelfRegulationSCP2 | medium | 32 | 3.30 | 10.0 / 10.1 | 15.0 / 15.0 | 21.2 / 21.0 |
-| SelfRegulationSCP2 | large | 16 | 4.09 | 10.8 / 10.7 | 21.0 / 21.6 | 31.2 / 31.7 |
+- `Expected GPU-h` assumes average stopping around `15k` steps.
+- `Conservative GPU-h` assumes every trial runs the full `20k` steps.
+- ADA values are upper bounds, not direct measurements on an ADA 6000.
 
-Sweep budget by dataset. The three runtime columns mean:
+Observed memory placement signal from the probe set:
 
-- `Expected GPU-h (15k avg)`: reasonable planning number if average early stopping lands around `15k` steps
-- `Conservative GPU-h (20k)`: every trial runs the full `20k` steps
-- `Early-stop floor GPU-h (12k)`: optimistic lower bound if every trial stops at the earliest plausible `12k`-step point
+| Dataset | Placement note |
+| --- | --- |
+| `EigenWorms` | `large` at `batch_size=4` needs ADA once `n_layers >= 4` |
+| `EthanolConcentration` | `large` at `batch_size=32` needs ADA once `n_layers >= 4` |
+| `Heartbeat` | entire LinOSS-faithful grid stays on the 3050 tier |
+| `MotorImagery` | `medium` `n_layers=6` and all `large` rows need ADA |
+| `SelfRegulationSCP1` | entire LinOSS-faithful grid stays on the 3050 tier |
+| `SelfRegulationSCP2` | `large` `n_layers=6` needs ADA |
 
-| Dataset | Trials | Groups | Expected GPU-h (15k avg) | Conservative GPU-h (20k) | Early-stop floor GPU-h (12k) |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| EigenWorms | 270 | 10 | 66.0 | 88.0 | 52.8 |
-| EthanolConcentration | 270 | 10 | 52.5 | 70.0 | 42.0 |
-| Heartbeat | 270 | 10 | 45.2 | 60.3 | 36.2 |
-| MotorImagery | 270 | 10 | 70.0 | 93.3 | 56.0 |
-| SelfRegulationSCP1 | 270 | 10 | 47.2 | 62.9 | 37.7 |
-| SelfRegulationSCP2 | 270 | 10 | 54.4 | 72.5 | 43.5 |
-| Total | 1620 | 60 | 335.3 | 447.0 | 268.2 |
+Concrete wall-clock examples if you run both tiers at the same time:
 
-Expected wall-clock if you spread the sweep across multiple RTX 3060 GPUs:
+| Hardware allocation | 3050 tier wall-clock h expected / conservative | ADA tier wall-clock h expected upper / conservative upper | Whole sweep wall-clock h expected upper / conservative upper |
+| --- | ---: | ---: | ---: |
+| `4 x RTX 3050` + `2 x ADA 6000` | `78.0 / 104.0` | `45.4 / 60.6` | `78.0 / 104.0` |
+| `8 x RTX 3050` + `1 x ADA 6000` | `39.0 / 52.0` | `90.8 / 121.1` | `90.8 / 121.1` |
+| `8 x RTX 3050` + `2 x ADA 6000` | `39.0 / 52.0` | `45.4 / 60.6` | `45.4 / 60.6` |
+| `16 x RTX 3050` + `2 x ADA 6000` | `19.5 / 26.0` | `45.4 / 60.6` | `45.4 / 60.6` |
 
-| 3060 GPUs in parallel | Expected wall-clock h (15k avg) | Conservative wall-clock h (20k) | Early-stop floor h (12k) |
-| ---: | ---: | ---: | ---: |
-| 1 | 335.3 | 447.0 | 268.2 |
-| 2 | 167.6 | 223.5 | 134.1 |
-| 4 | 83.8 | 111.8 | 67.1 |
-| 8 | 41.9 | 55.9 | 33.5 |
+For practical planning, the cleanest baseline is:
 
-For practical planning, I would budget around `335 GPU-hours` for the full sweep, and keep `447 GPU-hours` in mind as the strict worst-case cap if the entire grid runs to `20k` steps.
+- budget `312.1` GPU-hours for the 3050 tier
+- budget at most `90.8` additional GPU-hours for the ADA tier
+- keep `537.2` GPU-hours in mind as the strict combined worst-case upper bound if everything runs to `20k` steps and the ADA-only rows behave no better than the conservative proxy
 
 ---
 

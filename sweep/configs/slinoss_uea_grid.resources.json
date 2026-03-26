@@ -1,0 +1,113 @@
+{
+  "default_tier": "rtx3050-8gb",
+  "rules": [
+    {
+      "match": {"dataset_name": "EigenWorms", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 4, "batch_size": 4},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.494140625,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "EigenWorms", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 6, "batch_size": 4},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.498046875,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "EigenWorms", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 4, "batch_size": 4},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.52734375,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "EigenWorms", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 6, "batch_size": 4},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.53125,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "EthanolConcentration", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 4, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.271484375,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "EthanolConcentration", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 6, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.275390625,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "EthanolConcentration", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 4, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.271484375,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "EthanolConcentration", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 6, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.275390625,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "MotorImagery", "d_model": 64, "d_head": 32, "d_state": 16, "include_time": false, "n_layers": 6, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.43359375,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "MotorImagery", "d_model": 64, "d_head": 32, "d_state": 16, "include_time": true, "n_layers": 6, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.439453125,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 2, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.44921875,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 4, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.47265625,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 6, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.474609375,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 2, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.474609375,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 4, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.478515625,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 6, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.48046875,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "SelfRegulationSCP2", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 6, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.44921875,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    },
+    {
+      "match": {"dataset_name": "SelfRegulationSCP2", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 6, "batch_size": 32},
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.44921875,
+      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+    }
+  ]
+}

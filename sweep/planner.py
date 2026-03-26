@@ -11,10 +11,12 @@ from itertools import product
 from train_torch import derive_slinoss_run_seeds
 from sweep.types import (
     DatasetConfig,
+    ResourceProfile,
     SweepDefinition,
     SweepPlan,
     TrialGroup,
     TrialSpec,
+    TrialResourceRule,
 )
 
 
@@ -42,6 +44,53 @@ def _expand_config_grid(base_config, axes: dict[str, tuple[object, ...]]):
             config = replace(config, **{name: value})
         variants.append(config)
     return tuple(variants)
+
+
+def _resource_rule_matches(
+    rule: TrialResourceRule,
+    *,
+    dataset_cfg,
+    training_cfg,
+    model_cfg,
+) -> bool:
+    match = rule.match
+    return (
+        (match.dataset_name is None or match.dataset_name == dataset_cfg.name)
+        and (
+            match.include_time is None
+            or match.include_time == dataset_cfg.include_time
+        )
+        and (match.batch_size is None or match.batch_size == training_cfg.batch_size)
+        and (match.d_model is None or match.d_model == model_cfg.d_model)
+        and (match.d_head is None or match.d_head == model_cfg.d_head)
+        and (match.d_state is None or match.d_state == model_cfg.d_state)
+        and (match.n_layers is None or match.n_layers == model_cfg.n_layers)
+    )
+
+
+def _resolve_resource_metadata(
+    resource_profile: ResourceProfile | None,
+    *,
+    dataset_cfg,
+    training_cfg,
+    model_cfg,
+) -> tuple[str | None, float | None, str | None]:
+    if resource_profile is None:
+        return None, None, None
+
+    for rule in resource_profile.rules:
+        if _resource_rule_matches(
+            rule,
+            dataset_cfg=dataset_cfg,
+            training_cfg=training_cfg,
+            model_cfg=model_cfg,
+        ):
+            return (
+                rule.resource_tier,
+                rule.estimated_peak_vram_gb,
+                rule.note,
+            )
+    return resource_profile.default_tier, None, None
 
 
 def build_sweep_plan(definition: SweepDefinition) -> SweepPlan:
@@ -89,6 +138,14 @@ def build_sweep_plan(definition: SweepDefinition) -> SweepPlan:
                             family_id,
                             f"seed-{seed}",
                         )
+                        resource_tier, estimated_peak_vram_gb, resource_note = (
+                            _resolve_resource_metadata(
+                                definition.resource_profile,
+                                dataset_cfg=dataset_cfg,
+                                training_cfg=training_cfg,
+                                model_cfg=model_cfg,
+                            )
+                        )
                         trial_rows.append(
                             (
                                 dataset_cfg.name,
@@ -107,6 +164,9 @@ def build_sweep_plan(definition: SweepDefinition) -> SweepPlan:
                                     training=training_cfg,
                                     model=model_cfg,
                                     output_dir=output_dir,
+                                    resource_tier=resource_tier,
+                                    estimated_peak_vram_gb=estimated_peak_vram_gb,
+                                    resource_note=resource_note,
                                 ),
                             )
                         )
@@ -181,12 +241,24 @@ def select_groups(
     *,
     shard: str | None = None,
     datasets: set[str] | None = None,
+    resource_tiers: set[str] | None = None,
     max_groups: int | None = None,
     max_trials: int | None = None,
 ) -> tuple[TrialGroup, ...]:
     groups = list(plan.groups)
     if datasets:
         groups = [group for group in groups if group.dataset.name in datasets]
+    if resource_tiers:
+        filtered_groups: list[TrialGroup] = []
+        for group in groups:
+            filtered_trials = tuple(
+                trial
+                for trial in group.trials
+                if trial.resource_tier in resource_tiers
+            )
+            if filtered_trials:
+                filtered_groups.append(replace(group, trials=filtered_trials))
+        groups = filtered_groups
     if shard is not None:
         shard_index, shard_total = parse_shard_spec(shard)
         groups = [

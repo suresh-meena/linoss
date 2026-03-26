@@ -63,6 +63,40 @@ class ModelConfig:
 
 
 @dataclass(frozen=True)
+class TrialResourceMatch:
+    dataset_name: str | None = None
+    include_time: bool | None = None
+    batch_size: int | None = None
+    d_model: int | None = None
+    d_head: int | None = None
+    d_state: int | None = None
+    n_layers: int | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class TrialResourceRule:
+    match: TrialResourceMatch
+    resource_tier: str
+    estimated_peak_vram_gb: float | None = None
+    note: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class ResourceProfile:
+    default_tier: str | None = None
+    rules: tuple[TrialResourceRule, ...] = ()
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class DatasetSweepDefinition:
     seeds: tuple[int, ...]
     dataset: DatasetConfig
@@ -81,6 +115,7 @@ class SweepDefinition:
     name: str
     output_root: str
     datasets: tuple[DatasetSweepDefinition, ...]
+    resource_profile: ResourceProfile | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -100,6 +135,9 @@ class TrialSpec:
     training: TrainingConfig
     model: ModelConfig
     output_dir: str
+    resource_tier: str | None = None
+    estimated_peak_vram_gb: float | None = None
+    resource_note: str | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

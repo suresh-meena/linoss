@@ -24,6 +24,7 @@ The grouping key is `(dataset config, dataset seed)`, so trials that share the s
 {
   "name": "slinoss-uea-grid",
   "output_root": "outputs/sweeps/slinoss-uea-grid",
+  "resource_profile": "slinoss_uea_grid.resources.json",
   "defaults": {
     "dataset": {
       "data_dir": "data_dir",
@@ -65,12 +66,22 @@ The grouping key is `(dataset config, dataset seed)`, so trials that share the s
 
 `grid` axes can be defined at the top level and overridden per dataset under `datasets[].grid`.
 
+If you want to keep one hyperparameter grid but route specific rows to different hardware classes, add a `resource_profile`. The profile can set a `default_tier` and then override selected rows with rule-based matches.
+
 ## Commands
 
 Preview the full plan:
 
 ```bash
 python -m sweep plan --config sweep/configs/slinoss_uea_grid.example.json
+```
+
+Preview only the trials assigned to one hardware tier:
+
+```bash
+python -m sweep plan \
+  --config sweep/configs/slinoss_uea_grid.json \
+  --resource-tier rtx3050-8gb
 ```
 
 Run one quarter of the work on the first two GPUs of a machine:
@@ -89,6 +100,16 @@ python -m sweep run \
   --config sweep/configs/slinoss_uea_grid.example.json \
   --devices cuda:0,cuda:1 \
   --shard 2/4
+```
+
+Run only the ADA-tagged rows:
+
+```bash
+python -m sweep run \
+  --config sweep/configs/slinoss_uea_grid.json \
+  --resource-tier ada6000 \
+  --devices cuda:0 \
+  --shard 1/2
 ```
 
 Reduce finished trials into a family leaderboard:

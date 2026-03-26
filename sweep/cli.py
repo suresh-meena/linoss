@@ -43,7 +43,8 @@ def _print_selected_trials(groups, *, preview: int) -> None:
             f"{trial.dataset.name} seed={trial.seed} family={trial.family_id} "
             f"lr={trial.training.lr} batch_size={trial.training.batch_size} "
             f"d_model={trial.model.d_model} n_layers={trial.model.n_layers} "
-            f"d_state={trial.model.d_state}"
+            f"d_state={trial.model.d_state} "
+            f"tier={trial.resource_tier or 'unassigned'}"
         )
 
 
@@ -61,10 +62,12 @@ def _build_plan_and_materialize(config_path: str):
 
 def _selected_groups_from_args(plan, args):
     dataset_filter = set(args.dataset) if args.dataset else None
+    resource_tiers = set(args.resource_tier) if args.resource_tier else None
     return select_groups(
         plan,
         shard=args.shard,
         datasets=dataset_filter,
+        resource_tiers=resource_tiers,
         max_groups=args.max_groups,
         max_trials=args.max_trials,
     )
@@ -166,6 +169,12 @@ def build_parser() -> argparse.ArgumentParser:
             action="append",
             default=[],
             help="Optional dataset filter. Repeat for multiple datasets.",
+        )
+        command_parser.add_argument(
+            "--resource-tier",
+            action="append",
+            default=[],
+            help="Optional resource tier filter. Repeat for multiple tiers.",
         )
         command_parser.add_argument(
             "--shard",

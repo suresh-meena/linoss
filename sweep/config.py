@@ -12,7 +12,10 @@ from sweep.types import (
     DatasetConfig,
     DatasetSweepDefinition,
     ModelConfig,
+    ResourceProfile,
     SweepDefinition,
+    TrialResourceMatch,
+    TrialResourceRule,
     TrainingConfig,
 )
 
@@ -62,6 +65,74 @@ def _build_dataclass(cls: type[T], values: dict[str, Any]) -> T:
     return cls(**values)
 
 
+def _load_resource_profile(
+    raw_profile: str | dict[str, Any] | None,
+    *,
+    config_path: Path,
+) -> ResourceProfile | None:
+    if raw_profile is None:
+        return None
+
+    if isinstance(raw_profile, str):
+        profile_path = Path(raw_profile)
+        if not profile_path.is_absolute():
+            profile_path = config_path.parent / profile_path
+        with profile_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    elif isinstance(raw_profile, dict):
+        payload = raw_profile
+    else:
+        raise ValueError(
+            "Top-level 'resource_profile' must be a JSON object or a path string."
+        )
+
+    default_tier = payload.get("default_tier")
+    if default_tier is not None and not isinstance(default_tier, str):
+        raise ValueError("resource_profile.default_tier must be a string.")
+
+    raw_rules = payload.get("rules", [])
+    if not isinstance(raw_rules, list):
+        raise ValueError("resource_profile.rules must be a JSON list.")
+
+    rules: list[TrialResourceRule] = []
+    for raw_rule in raw_rules:
+        if not isinstance(raw_rule, dict):
+            raise ValueError("Each resource profile rule must be a JSON object.")
+        raw_match = raw_rule.get("match")
+        if not isinstance(raw_match, dict):
+            raise ValueError("Each resource profile rule must define a match object.")
+        resource_tier = raw_rule.get("resource_tier")
+        if not isinstance(resource_tier, str) or not resource_tier:
+            raise ValueError(
+                "Each resource profile rule must define a non-empty resource_tier."
+            )
+        estimated_peak_vram_gb = raw_rule.get("estimated_peak_vram_gb")
+        if estimated_peak_vram_gb is not None and not isinstance(
+            estimated_peak_vram_gb, (int, float)
+        ):
+            raise ValueError(
+                "resource_profile rule estimated_peak_vram_gb must be numeric."
+            )
+        note = raw_rule.get("note")
+        if note is not None and not isinstance(note, str):
+            raise ValueError("resource_profile rule note must be a string.")
+
+        rules.append(
+            TrialResourceRule(
+                match=_build_dataclass(TrialResourceMatch, raw_match),
+                resource_tier=resource_tier,
+                estimated_peak_vram_gb=(
+                    float(estimated_peak_vram_gb)
+                    if estimated_peak_vram_gb is not None
+                    else None
+                ),
+                note=note,
+            )
+        )
+
+    return ResourceProfile(default_tier=default_tier, rules=tuple(rules))
+
+
 def load_sweep_definition(path: str | os.PathLike[str]) -> SweepDefinition:
     config_path = Path(path)
     with config_path.open("r", encoding="utf-8") as handle:
@@ -97,6 +168,10 @@ def load_sweep_definition(path: str | os.PathLike[str]) -> SweepDefinition:
         raise ValueError("Top-level 'seeds' must be a non-empty list of integers.")
 
     dataset_defs: list[DatasetSweepDefinition] = []
+    resource_profile = _load_resource_profile(
+        raw.get("resource_profile"),
+        config_path=config_path,
+    )
     default_dataset_values = defaults.get("dataset", {})
     default_training_values = defaults.get("training", {})
     default_model_values = defaults.get("model", {})
@@ -168,4 +243,5 @@ def load_sweep_definition(path: str | os.PathLike[str]) -> SweepDefinition:
         name=name,
         output_root=output_root,
         datasets=tuple(dataset_defs),
+        resource_profile=resource_profile,
     )

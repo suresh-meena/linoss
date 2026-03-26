@@ -1,6 +1,7 @@
 {
   "name": "slinoss-uea-grid",
   "output_root": "outputs/sweeps/slinoss-uea-grid",
+  "resource_profile": "slinoss_uea_grid.resources.json",
   "defaults": {
     "dataset": {
       "data_dir": "data_dir",
@@ -51,7 +52,7 @@
       "name": "EigenWorms",
       "seeds": [2345, 3456, 4567, 5678, 6789],
       "overrides": {
-        "training": {"batch_size": 8},
+        "training": {"batch_size": 4},
         "model": {"d_model": 16, "d_head": 16, "d_state": 16}
       }
     },
@@ -59,7 +60,7 @@
       "name": "EigenWorms",
       "seeds": [2345, 3456, 4567, 5678, 6789],
       "overrides": {
-        "training": {"batch_size": 2},
+        "training": {"batch_size": 4},
         "model": {"d_model": 64, "d_head": 32, "d_state": 16}
       }
     },
@@ -67,7 +68,7 @@
       "name": "EigenWorms",
       "seeds": [2345, 3456, 4567, 5678, 6789],
       "overrides": {
-        "training": {"batch_size": 1},
+        "training": {"batch_size": 4},
         "model": {"d_model": 128, "d_head": 64, "d_state": 64}
       }
     },
@@ -91,7 +92,7 @@
       "name": "EthanolConcentration",
       "seeds": [2345, 3456, 4567, 5678, 6789],
       "overrides": {
-        "training": {"batch_size": 8},
+        "training": {"batch_size": 32},
         "model": {"d_model": 128, "d_head": 64, "d_state": 64}
       }
     },
@@ -131,7 +132,7 @@
       "name": "MotorImagery",
       "seeds": [2345, 3456, 4567, 5678, 6789],
       "overrides": {
-        "training": {"batch_size": 16},
+        "training": {"batch_size": 32},
         "model": {"d_model": 64, "d_head": 32, "d_state": 16}
       }
     },
@@ -139,7 +140,7 @@
       "name": "MotorImagery",
       "seeds": [2345, 3456, 4567, 5678, 6789],
       "overrides": {
-        "training": {"batch_size": 8},
+        "training": {"batch_size": 32},
         "model": {"d_model": 128, "d_head": 64, "d_state": 64}
       }
     },
@@ -163,7 +164,7 @@
       "name": "SelfRegulationSCP1",
       "seeds": [2345, 3456, 4567, 5678, 6789],
       "overrides": {
-        "training": {"batch_size": 16},
+        "training": {"batch_size": 32},
         "model": {"d_model": 128, "d_head": 64, "d_state": 64}
       }
     },
@@ -187,7 +188,7 @@
       "name": "SelfRegulationSCP2",
       "seeds": [2345, 3456, 4567, 5678, 6789],
       "overrides": {
-        "training": {"batch_size": 16},
+        "training": {"batch_size": 32},
         "model": {"d_model": 128, "d_head": 64, "d_state": 64}
       }
     }
