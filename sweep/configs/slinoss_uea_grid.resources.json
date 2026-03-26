@@ -2,112 +2,522 @@
   "default_tier": "rtx3050-6gb",
   "rules": [
     {
-      "match": {"dataset_name": "EigenWorms", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 4, "batch_size": 4},
+      "match": {
+        "dataset_name": "EigenWorms",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 2,
+        "batch_size": 4
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.494140625,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 5.677734375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "EigenWorms", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 6, "batch_size": 4},
+      "match": {
+        "dataset_name": "EigenWorms",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 4,
+        "batch_size": 4
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.498046875,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 9.029296875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "EigenWorms", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 4, "batch_size": 4},
+      "match": {
+        "dataset_name": "EigenWorms",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 6,
+        "batch_size": 4
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.52734375,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 12.482421875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "EigenWorms", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 6, "batch_size": 4},
+      "match": {
+        "dataset_name": "EigenWorms",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 2,
+        "batch_size": 4
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.53125,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 5.8203125,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "EthanolConcentration", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 4, "batch_size": 32},
+      "match": {
+        "dataset_name": "EigenWorms",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 4,
+        "batch_size": 4
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.271484375,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 9.16796875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "EthanolConcentration", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 6, "batch_size": 32},
+      "match": {
+        "dataset_name": "EigenWorms",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 6,
+        "batch_size": 4
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.275390625,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 12.517578125,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "EthanolConcentration", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 4, "batch_size": 32},
+      "match": {
+        "dataset_name": "EthanolConcentration",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 4,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.271484375,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 8.3046875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "EthanolConcentration", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 6, "batch_size": 32},
+      "match": {
+        "dataset_name": "EthanolConcentration",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 6,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.275390625,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 10.412109375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "MotorImagery", "d_model": 64, "d_head": 32, "d_state": 16, "include_time": false, "n_layers": 6, "batch_size": 32},
+      "match": {
+        "dataset_name": "EthanolConcentration",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 2,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.43359375,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 5.5546875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "MotorImagery", "d_model": 64, "d_head": 32, "d_state": 16, "include_time": true, "n_layers": 6, "batch_size": 32},
+      "match": {
+        "dataset_name": "EthanolConcentration",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 4,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.439453125,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 7.83984375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 2, "batch_size": 32},
+      "match": {
+        "dataset_name": "EthanolConcentration",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 6,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.44921875,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 10.482421875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 4, "batch_size": 32},
+      "match": {
+        "dataset_name": "MotorImagery",
+        "d_model": 64,
+        "d_head": 32,
+        "d_state": 16,
+        "include_time": false,
+        "n_layers": 4,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.47265625,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 6.79296875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 6, "batch_size": 32},
+      "match": {
+        "dataset_name": "MotorImagery",
+        "d_model": 64,
+        "d_head": 32,
+        "d_state": 16,
+        "include_time": false,
+        "n_layers": 6,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.474609375,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 8.505859375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 2, "batch_size": 32},
+      "match": {
+        "dataset_name": "MotorImagery",
+        "d_model": 64,
+        "d_head": 32,
+        "d_state": 16,
+        "include_time": true,
+        "n_layers": 4,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.474609375,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 6.83984375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 4, "batch_size": 32},
+      "match": {
+        "dataset_name": "MotorImagery",
+        "d_model": 64,
+        "d_head": 32,
+        "d_state": 16,
+        "include_time": true,
+        "n_layers": 6,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.478515625,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 8.595703125,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "MotorImagery", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 6, "batch_size": 32},
+      "match": {
+        "dataset_name": "MotorImagery",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 2,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.48046875,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 10.16796875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "SelfRegulationSCP2", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": false, "n_layers": 6, "batch_size": 32},
+      "match": {
+        "dataset_name": "MotorImagery",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 4,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.44921875,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 14.6484375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     },
     {
-      "match": {"dataset_name": "SelfRegulationSCP2", "d_model": 128, "d_head": 64, "d_state": 64, "include_time": true, "n_layers": 6, "batch_size": 32},
+      "match": {
+        "dataset_name": "MotorImagery",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 6,
+        "batch_size": 32
+      },
       "resource_tier": "ada6000",
-      "estimated_peak_vram_gb": 5.44921875,
-      "note": "LinOSS-faithful batch size OOMed in the persistent-worker probe."
+      "estimated_peak_vram_gb": 18.333984375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "MotorImagery",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 2,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 9.63671875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "MotorImagery",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 4,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 14.462890625,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "MotorImagery",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 6,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 18.7890625,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP1",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 2,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.833984375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP1",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 4,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 7.099609375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP1",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 6,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 8.37890625,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP1",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 2,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.630859375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP1",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 4,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 7.072265625,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP1",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 6,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 8.4609375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP2",
+        "d_model": 64,
+        "d_head": 32,
+        "d_state": 16,
+        "include_time": false,
+        "n_layers": 4,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.5859375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP2",
+        "d_model": 64,
+        "d_head": 32,
+        "d_state": 16,
+        "include_time": false,
+        "n_layers": 6,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 6.23046875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP2",
+        "d_model": 64,
+        "d_head": 32,
+        "d_state": 16,
+        "include_time": true,
+        "n_layers": 4,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 5.556640625,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP2",
+        "d_model": 64,
+        "d_head": 32,
+        "d_state": 16,
+        "include_time": true,
+        "n_layers": 6,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 6.318359375,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP2",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 2,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 6.9140625,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP2",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 4,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 8.72265625,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP2",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": false,
+        "n_layers": 6,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 10.19140625,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP2",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 2,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 7.03515625,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP2",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 4,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 8.51171875,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
+    },
+    {
+      "match": {
+        "dataset_name": "SelfRegulationSCP2",
+        "d_model": 128,
+        "d_head": 64,
+        "d_state": 64,
+        "include_time": true,
+        "n_layers": 6,
+        "batch_size": 32
+      },
+      "resource_tier": "ada6000",
+      "estimated_peak_vram_gb": 10.3203125,
+      "note": "NumPy-backed March 27, 2026 recalibration exceeded the 5.5 GiB RTX 3050 safety cap."
     }
   ]
 }

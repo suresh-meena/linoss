@@ -87,3 +87,19 @@ def test_build_sweep_plan_and_shard_selection(tmp_path) -> None:
     assert len(tier_groups) == 2
     assert all(len(group.trials) == 1 for group in tier_groups)
     assert all(trial.resource_tier == "ada6000" for group in tier_groups for trial in group.trials)
+
+
+def test_checked_in_uea_resource_profile_counts() -> None:
+    definition = load_sweep_definition("sweep/configs/slinoss_uea_grid.json")
+    plan = build_sweep_plan(definition)
+
+    assert len(plan.trials) == 1620
+    assert len(plan.groups) == 60
+
+    rtx3050_groups = select_groups(plan, resource_tiers={"rtx3050-6gb"})
+    ada_groups = select_groups(plan, resource_tiers={"ada6000"})
+
+    assert sum(len(group.trials) for group in rtx3050_groups) == 1065
+    assert sum(len(group.trials) for group in ada_groups) == 555
+    assert len(rtx3050_groups) == 60
+    assert len(ada_groups) == 50

@@ -137,29 +137,36 @@ The hardware split is not baked into the hyperparameter grid itself. It is expre
 ### Hardware Tiers
 
 The checked-in resource profile currently defines two execution tiers. On March
-26, 2026, I reran the full `108` unique config rows on the remote 3090 box with
-a conservative `5.5 GiB` per-process cap to emulate the actual RTX 3050 `6 GB`
-fleet. That recalibration reproduced the same `18` ADA-only rows as the earlier
-draft, so the split below is now confirmed for `6 GB` cards rather than carried
-over from the old `8 GB` planning assumption.
+27, 2026, after rewriting the processed UEA pickles to NumPy and ensuring the
+Torch path no longer unpickles JAX arrays, I reran the full `108` unique config
+rows on the ADA box with the same conservative `5.5 GiB` per-process cap used
+to approximate the RTX 3050 `6 GB` fleet. That recalibration tightened the
+boundary from `18` to `37` ADA-only config rows. The earlier split was
+optimistic.
 
 | Resource tier | Intended hardware | Trials | Groups after filtering | Purpose |
 | --- | --- | ---: | ---: | --- |
-| `rtx3050-6gb` | RTX 3050 6 GB fleet | 1350 | 60 | Default tier for everything that probed cleanly under the LinOSS-faithful batch sizes |
-| `ada6000` | RTX ADA 6000 | 270 | 40 | Deep-family rows that OOMed on the probe box under the LinOSS-faithful batch sizes |
+| `rtx3050-6gb` | RTX 3050 6 GB fleet | 1065 | 60 | Rows that stayed within the `5.5 GiB` safety cap under the NumPy-backed recalibration |
+| `ada6000` | RTX ADA 6000 | 555 | 50 | Rows that exceeded the `5.5 GiB` safety cap after JAX was removed from the Torch data path |
 
 The ADA-only rows are:
 
 | Dataset | 3050-safe rows | ADA-only rows |
 | --- | --- | --- |
-| `EigenWorms` | `small` all layers, `medium` all layers, `large` `n_layers=2` | `large` `n_layers=4/6` |
-| `EthanolConcentration` | `small` all layers, `medium` all layers, `large` `n_layers=2` | `large` `n_layers=4/6` |
+| `EigenWorms` | `small` all layers, `medium` all layers | `large` all layers |
+| `EthanolConcentration` | `small` all layers, `medium` all layers, `large` with `include_time=false`, `n_layers=2` | `large` with `include_time=false`, `n_layers=4/6`, and all `large` rows with `include_time=true` |
 | `Heartbeat` | all families, all layers | none |
-| `MotorImagery` | `small` all layers, `medium` `n_layers=2/4` | `medium` `n_layers=6`, `large` `n_layers=2/4/6` |
-| `SelfRegulationSCP1` | all families, all layers | none |
-| `SelfRegulationSCP2` | `small` all layers, `medium` all layers, `large` `n_layers=2/4` | `large` `n_layers=6` |
+| `MotorImagery` | `small` all layers, `medium` `n_layers=2` | `medium` `n_layers=4/6`, `large` `n_layers=2/4/6` |
+| `SelfRegulationSCP1` | `small` all layers, `medium` all layers | `large` all layers |
+| `SelfRegulationSCP2` | `small` all layers, `medium` `n_layers=2` | `medium` `n_layers=4/6`, `large` all layers |
 
-Counting both `include_time=false/true`, that is `18` ADA-only config rows or `270` trials.
+Counting both `include_time=false/true`, that is `37` ADA-only config rows or `555` trials.
+
+This happened because the tiering rule is keyed off peak reserved CUDA memory
+under a `5.5 GiB` safety cap. Removing JAX-backed pickles from the Torch data
+path reduced one source of GPU pressure, but it also let the CUDA side reserve
+larger pools or workspaces on some rows. The old split understated the true
+memory footprint of the new sweep path.
 
 ### Remote Fleet Workflow
 
@@ -226,8 +233,8 @@ python -m sweep plan --config sweep/configs/slinoss_uea_grid.json --resource-tie
 This should report:
 
 - full plan: `1620` trials across `60` groups
-- `rtx3050-6gb`: `1350` trials across `60` filtered groups
-- `ada6000`: `270` trials across `40` filtered groups
+- `rtx3050-6gb`: `1065` trials across `60` filtered groups
+- `ada6000`: `555` trials across `50` filtered groups
 
 `--shard` is applied after resource-tier filtering, so the 3050 and ADA pools
 can be managed independently.
@@ -350,66 +357,37 @@ rsync -a .remote-state/sweeps/slinoss-uea-grid/canonical/ outputs/sweeps/slinoss
 python -m sweep reduce --config sweep/configs/slinoss_uea_grid.json
 ```
 
-### Probe-Based Budget And Placement Estimates
+### Probe-Based Placement Estimates
 
-The timing probes were run with the new SLinOSS path in strict FP32, with
-`torch.compile` disabled, mixed precision disabled, `5` warmup steps, and `20`
-timed training steps per configuration. The timing numbers below use the raw
-probe timings as conservative planning inputs. They are not direct RTX 3050
-benchmarks, but they were measured on a remote 3090 box that, on a matched
-calibration case, was slower than the local 3060 run for this code path.
+The March 27, 2026 placement rerun is now the authoritative boundary for the
+checked-in resource profile. It used the new NumPy-backed processed UEA data,
+strict FP32, `torch.compile` disabled, mixed precision disabled, `5` warmup
+steps, and `20` timed training steps per configuration. Every one of the `108`
+calibration rows completed cleanly, and every one loaded `ndarray` pickles on
+the Torch path.
 
-The same March 26, 2026 rerun also reapplied a `5.5 GiB` cap to the full
-`108`-row calibration table to mimic the real RTX 3050 `6 GB` cards. That pass
-confirmed that the `6 GB` fleet uses the same placement boundary as the earlier
-draft, so the trial counts and budget tables below are unchanged apart from the
-updated tier name.
+The earlier wall-clock budget table is intentionally not carried forward here.
+Those numbers were tied to the old `18`-row ADA split, and the new placement
+rerun was executed on the ADA box rather than the slower 3050 fleet. Leaving
+the old table in place would be more misleading than helpful.
 
-The ADA-only rows also OOMed on the 24 GB probe box under the exact LinOSS-faithful batch sizes. Their runtime budget is therefore an upper bound derived from smaller-batch safe probes for the same rows. In practice, the ADA 6000 should be strictly better than this bound.
+Use this per-dataset split for placement planning:
 
-Per-dataset split and budget:
+| Dataset | 3050 trials | ADA trials | Placement note |
+| --- | ---: | ---: | --- |
+| `EigenWorms` | 180 | 90 | all `large` rows move to ADA |
+| `EthanolConcentration` | 195 | 75 | all `large` rows with `include_time=true`, plus `large` `include_time=false` at `n_layers=4/6`, move to ADA |
+| `Heartbeat` | 270 | 0 | entire grid stays on 3050 |
+| `MotorImagery` | 120 | 150 | `medium` `n_layers=4/6` and all `large` rows move to ADA |
+| `SelfRegulationSCP1` | 180 | 90 | all `large` rows move to ADA |
+| `SelfRegulationSCP2` | 120 | 150 | `medium` `n_layers=4/6` and all `large` rows move to ADA |
+| Total | 1065 | 555 | `37` ADA-only row families out of `108` |
 
-| Dataset | 3050 trials | ADA trials | 3050 expected GPU-h | 3050 conservative GPU-h | ADA expected upper GPU-h | ADA conservative upper GPU-h |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| EigenWorms | 210 | 60 | 62.0 | 82.7 | 20.0 | 26.6 |
-| EthanolConcentration | 210 | 60 | 45.9 | 61.2 | 15.4 | 20.6 |
-| Heartbeat | 270 | 0 | 45.2 | 60.3 | 0.0 | 0.0 |
-| MotorImagery | 150 | 120 | 36.1 | 48.2 | 43.6 | 58.2 |
-| SelfRegulationSCP1 | 270 | 0 | 67.4 | 89.9 | 0.0 | 0.0 |
-| SelfRegulationSCP2 | 240 | 30 | 55.4 | 73.8 | 11.8 | 15.7 |
-| Total | 1350 | 270 | 312.1 | 416.1 | 90.8 | 121.1 |
+The practical implication is:
 
-Interpretation:
-
-- `Expected GPU-h` assumes average stopping around `15k` steps.
-- `Conservative GPU-h` assumes every trial runs the full `20k` steps.
-- ADA values are upper bounds, not direct measurements on an ADA 6000.
-
-Observed memory placement signal from the probe set:
-
-| Dataset | Placement note |
-| --- | --- |
-| `EigenWorms` | `large` at `batch_size=4` needs ADA once `n_layers >= 4` |
-| `EthanolConcentration` | `large` at `batch_size=32` needs ADA once `n_layers >= 4` |
-| `Heartbeat` | entire LinOSS-faithful grid stays on the 3050 tier |
-| `MotorImagery` | `medium` `n_layers=6` and all `large` rows need ADA |
-| `SelfRegulationSCP1` | entire LinOSS-faithful grid stays on the 3050 tier |
-| `SelfRegulationSCP2` | `large` `n_layers=6` needs ADA |
-
-Concrete wall-clock examples if you run both tiers at the same time:
-
-| Hardware allocation | 3050 tier wall-clock h expected / conservative | ADA tier wall-clock h expected upper / conservative upper | Whole sweep wall-clock h expected upper / conservative upper |
-| --- | ---: | ---: | ---: |
-| `4 x RTX 3050` + `2 x ADA 6000` | `78.0 / 104.0` | `45.4 / 60.6` | `78.0 / 104.0` |
-| `8 x RTX 3050` + `1 x ADA 6000` | `39.0 / 52.0` | `90.8 / 121.1` | `90.8 / 121.1` |
-| `8 x RTX 3050` + `2 x ADA 6000` | `39.0 / 52.0` | `45.4 / 60.6` | `45.4 / 60.6` |
-| `16 x RTX 3050` + `2 x ADA 6000` | `19.5 / 26.0` | `45.4 / 60.6` | `45.4 / 60.6` |
-
-For practical planning, the cleanest baseline is:
-
-- budget `312.1` GPU-hours for the 3050 tier
-- budget at most `90.8` additional GPU-hours for the ADA tier
-- keep `537.2` GPU-hours in mind as the strict combined worst-case upper bound if everything runs to `20k` steps and the ADA-only rows behave no better than the conservative proxy
+- `19` row families moved from the old 3050 tier to ADA after the NumPy-backed recalibration.
+- `12` of those `19` rows went above `6 GiB` peak reserved memory outright, so this is not just a cap-margin artifact.
+- If you need fresh wall-clock budgets, rerun the timing pass on the actual 3050 fleet or on a deliberately conservative proxy before depending on the old GPU-hour estimates.
 
 ---
 
