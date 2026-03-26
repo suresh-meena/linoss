@@ -112,6 +112,21 @@ That config expands to:
 - total work: `1620` trials in `60` dataset-cache groups
 - one `(dataset, include_time, seed)` group contains `27` trials
 
+The original LinOSS repeat configs use a simpler dataset-level batch policy:
+
+- `EigenWorms`: `batch_size=4`
+- all other UEA datasets: `batch_size=32`
+
+I checked that exact policy against the SLinOSS grid before changing the production config. It is not fully runnable on the intended RTX 3060 fleet, and some of the failing cases also OOM on a `24 GiB` RTX 3090. The failing rows are:
+
+- `EigenWorms`, `large`, `n_layers=4/6`
+- `EthanolConcentration`, `large`, `n_layers=4/6`
+- `MotorImagery`, `medium`, `n_layers=6`
+- `MotorImagery`, `large`, `n_layers=2/4/6`
+- `SelfRegulationSCP2`, `large`, `n_layers=6`
+
+Counting both `include_time=false/true`, that is `18` failed config rows or `270` infeasible trials out of the full `1620`. Because of that, `sweep/configs/slinoss_uea_grid.json` intentionally keeps the lower per-family batch sizes that were actually validated for the complete SLinOSS search on 3060-class hardware.
+
 Before running a long production sweep, update `requirements.txt` to the first `slinoss` release that includes the upstream eval / `torch.no_grad()` fix from issue `#6`. The sweep code is ready now; the currently pinned `v0.1.1` wheel is not the release I would use for a multi-day production run.
 
 ### Manual Multi-Machine Workflow
