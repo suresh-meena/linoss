@@ -82,6 +82,16 @@ def _run_script(
     )
 
 
+def _write_fake_tools(tmp_path: Path, *names: str) -> Path:
+    tool_dir = tmp_path / "fake-tools"
+    tool_dir.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        path = tool_dir / name
+        path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        path.chmod(0o755)
+    return tool_dir
+
+
 def _write_sweep_fixture(tmp_path: Path, state_dir: Path) -> Path:
     config_path = tmp_path / "toy_sweep.json"
     config_path.write_text(
@@ -240,6 +250,50 @@ def test_remote_rsync_dry_run_redacts_password_auth(tmp_path: Path) -> None:
     assert "rsync" in result.stdout
     assert "bob@10.0.0.5:/scratch/kdrifting/" in result.stdout
     assert "super-secret" not in result.stdout
+
+
+def test_remote_shell_dry_run_supports_system_toolchain_without_guix(
+    tmp_path: Path,
+) -> None:
+    env_file = _write_remote_env(tmp_path)
+    fake_tools = _write_fake_tools(tmp_path, "ssh", "sshpass")
+    result = _run_script(
+        "remote-shell",
+        "--machine",
+        "scratch-box",
+        "--dry-run",
+        "--",
+        "hostname",
+        env_file=env_file,
+        extra_env={
+            "KD_REMOTE_TOOLCHAIN": "system",
+            "PATH": f"{fake_tools}{os.pathsep}{os.environ['PATH']}",
+        },
+    )
+    assert "sshpass" in result.stdout
+    assert "ssh " in result.stdout
+    assert "scripts/guix-run" not in result.stdout
+
+
+def test_remote_rsync_dry_run_supports_system_toolchain_without_guix(
+    tmp_path: Path,
+) -> None:
+    env_file = _write_remote_env(tmp_path)
+    fake_tools = _write_fake_tools(tmp_path, "ssh", "sshpass", "rsync")
+    result = _run_script(
+        "remote-rsync",
+        "--machine",
+        "scratch-box",
+        "--dry-run",
+        env_file=env_file,
+        extra_env={
+            "KD_REMOTE_TOOLCHAIN": "system",
+            "PATH": f"{fake_tools}{os.pathsep}{os.environ['PATH']}",
+        },
+    )
+    assert "rsync" in result.stdout
+    assert "sshpass" in result.stdout
+    assert "scripts/guix-run" not in result.stdout
 
 
 def test_remote_smoke_dry_run_uses_machine_workdir_and_strict_cd(

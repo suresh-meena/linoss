@@ -11,6 +11,9 @@
 
 - This repo ships remote experiment helpers under `scripts/`.
 - Machine definitions live in a root `.env` file that must remain untracked.
+- The remote helpers are not Guix-only. They prefer direct local `ssh`/`rsync`
+  and `sshpass` when available, and fall back to `./scripts/guix-run`
+  otherwise. Override with `KD_REMOTE_TOOLCHAIN=system|guix` when needed.
 - Prefer `AUTH=key` with `SSH_KEY` set. Keep `PASSWORD` populated as a fallback
   while public-key access is being rolled out or repaired.
 - Important local state is kept under the ignored `.remote-state/` directory.

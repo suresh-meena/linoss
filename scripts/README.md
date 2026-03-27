@@ -9,9 +9,10 @@ result cache.
 ## Files
 
 - `manifest.scm`
-  Guix manifest for the command-line tools the remote helpers use
+  Optional Guix manifest for the command-line tools the remote helpers use
 - `guix-run`
-  Run a command inside the Guix shell described by `manifest.scm`
+  Optional wrapper to run a command inside the Guix shell described by
+  `manifest.scm`
 - `remote-list`
   List configured machines, optionally filtered to one group
 - `remote-print-config`
@@ -48,6 +49,7 @@ The scripts read:
 - optional `KD_REMOTE_GROUP_<GROUP>`
 - optional `KD_REMOTE_STATE_DIR`
 - optional `KD_REMOTE_LEASE_ROOT`
+- optional `KD_REMOTE_TOOLCHAIN=auto|system|guix`
 - per-machine fields such as:
   `KD_REMOTE_<MACHINE>_HOST`
   `KD_REMOTE_<MACHINE>_USER`
@@ -67,6 +69,32 @@ replacing `-` or `.` with `_`.
 `WORKDIR` is optional for generic shell access, but strongly recommended. It is
 required for `remote-smoke`, `remote-setup`, `remote-collect`, and
 `remote-sweep-run`.
+
+## Local Tooling Requirements
+
+Guix is optional. The remote helpers now support two local toolchain modes:
+
+- `system`
+  Use `ssh`, `rsync`, and, for password-auth machines, `sshpass` directly from
+  `PATH`
+- `guix`
+  Run those tools through `./scripts/guix-run`
+
+By default the scripts use `KD_REMOTE_TOOLCHAIN=auto`, which prefers the direct
+system tools when they are available and falls back to Guix otherwise.
+
+So a user without Guix can still use the remote helpers as long as they have:
+
+- `ssh`
+- `rsync`
+- `sshpass` when any configured machine uses `AUTH=password`
+
+If you want to force one mode explicitly:
+
+```bash
+export KD_REMOTE_TOOLCHAIN=system
+export KD_REMOTE_TOOLCHAIN=guix
+```
 
 ## Centralized Local State
 

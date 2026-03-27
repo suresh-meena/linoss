@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import textwrap
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ KNOWN_HOSTS_FILE = ROOT / ".remote-known-hosts"
 DEFAULT_STATE_DIR = ROOT / ".remote-state"
 DEFAULT_LEASE_ROOT = "/tmp/linoss-agent-leases"
 DEFAULT_FANOUT_PARALLELISM = 4
+VALID_TOOLCHAIN_MODES = {"auto", "system", "guix"}
 
 
 class RemoteConfigError(RuntimeError):
@@ -323,6 +325,53 @@ def uses_sshpass(machine: RemoteMachine) -> bool:
     return machine.password is not None
 
 
+def toolchain_mode() -> str:
+    mode = os.environ.get("KD_REMOTE_TOOLCHAIN", "auto").strip().lower()
+    if mode not in VALID_TOOLCHAIN_MODES:
+        allowed = ", ".join(sorted(VALID_TOOLCHAIN_MODES))
+        raise RemoteConfigError(
+            f"invalid KD_REMOTE_TOOLCHAIN={mode!r}; expected one of: {allowed}"
+        )
+    return mode
+
+
+def _have_system_tools(*tools: str) -> bool:
+    return all(shutil.which(tool) for tool in tools)
+
+
+def _have_guix_toolchain() -> bool:
+    return GUIX_RUN.is_file() and shutil.which("guix") is not None
+
+
+def _toolchain_error(*tools: str) -> RemoteConfigError:
+    needed = ", ".join(tools)
+    return RemoteConfigError(
+        "missing required remote helper tools: "
+        f"{needed}. Install them directly on PATH or install Guix and use "
+        f"{GUIX_RUN}."
+    )
+
+
+def command_prefix(*tools: str) -> list[str]:
+    mode = toolchain_mode()
+    if mode == "system":
+        if not _have_system_tools(*tools):
+            raise _toolchain_error(*tools)
+        return []
+    if mode == "guix":
+        if not _have_guix_toolchain():
+            raise RemoteConfigError(
+                f"KD_REMOTE_TOOLCHAIN=guix requires `guix` on PATH and {GUIX_RUN}"
+            )
+        return [str(GUIX_RUN)]
+
+    if _have_system_tools(*tools):
+        return []
+    if _have_guix_toolchain():
+        return [str(GUIX_RUN)]
+    raise _toolchain_error(*tools)
+
+
 def ssh_auth_options(machine: RemoteMachine) -> list[str]:
     options: list[str] = []
     if machine.auth == "password":
@@ -347,7 +396,10 @@ def ssh_command(
     allocate_tty: bool,
     remote_command: str | None,
 ) -> list[str]:
-    command: list[str] = [str(GUIX_RUN)]
+    required_tools = ["ssh"]
+    if uses_sshpass(machine):
+        required_tools.append("sshpass")
+    command: list[str] = command_prefix(*required_tools)
     if uses_sshpass(machine):
         command += ["sshpass", "-e"]
     command.append("ssh")
@@ -374,6 +426,10 @@ def ssh_command(
 
 def rsync_ssh_transport(machine: RemoteMachine) -> str:
     parts: list[str] = []
+    required_tools = ["ssh"]
+    if uses_sshpass(machine):
+        required_tools.append("sshpass")
+    parts += command_prefix(*required_tools)
     if uses_sshpass(machine):
         parts += ["sshpass", "-e"]
     parts += [
@@ -1236,7 +1292,7 @@ def _build_rsync_command(
     delete: bool,
     extra_args: list[str] | None = None,
 ) -> list[str]:
-    command: list[str] = [str(GUIX_RUN), "rsync", "-az"]
+    command: list[str] = command_prefix("rsync") + ["rsync", "-az"]
     if delete:
         command.append("--delete")
     if extra_args:
