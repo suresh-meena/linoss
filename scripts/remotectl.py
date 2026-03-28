@@ -1738,12 +1738,31 @@ def command_setup(args: argparse.Namespace) -> int:
         install_lines = []
         if not args.skip_install:
             install_lines += [
-                f"{shlex.quote(args.python)} -m venv .venv",
+                f'SETUP_PYTHON={shlex.quote(args.python)}',
+                'if ! command -v "$SETUP_PYTHON" >/dev/null 2>&1; then',
+                '  MINIFORGE_ROOT="$HOME/miniforge3"',
+                '  MINIFORGE_PY="$MINIFORGE_ROOT/bin/python"',
+                '  if [ ! -x "$MINIFORGE_PY" ]; then',
+                '    MINIFORGE_URL="https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"',
+                '    MINIFORGE_INSTALLER="/tmp/miniforge-installer.sh"',
+                '    if command -v curl >/dev/null 2>&1; then',
+                '      curl -fsSL "$MINIFORGE_URL" -o "$MINIFORGE_INSTALLER"',
+                '    elif command -v wget >/dev/null 2>&1; then',
+                '      wget -qO "$MINIFORGE_INSTALLER" "$MINIFORGE_URL"',
+                "    else",
+                '      echo "missing requested python and no curl/wget available to bootstrap Miniforge" >&2',
+                "      exit 1",
+                "    fi",
+                '    bash "$MINIFORGE_INSTALLER" -b -p "$MINIFORGE_ROOT"',
+                "  fi",
+                '  SETUP_PYTHON="$MINIFORGE_PY"',
+                "fi",
+                '"$SETUP_PYTHON" -m venv .venv',
                 ".venv/bin/python -m pip install -U pip",
                 ".venv/bin/pip install -r requirements.txt",
             ]
         install_lines += [
-            "python3 --version",
+            ".venv/bin/python --version",
             "if command -v nvidia-smi >/dev/null 2>&1; then "
             "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader; "
             "else echo 'nvidia-smi missing' >&2; exit 1; fi",
