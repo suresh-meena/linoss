@@ -1984,7 +1984,7 @@ def command_sweep_run(args: argparse.Namespace) -> int:
             [
                 "#!/usr/bin/env bash",
                 "set -eu",
-                f"cleanup() {{ rm -f {{shlex.quote(str(lease_path))}}; }}",
+                f"cleanup() {{{{ rm -f {{shlex.quote(str(lease_path))}}; }}}}",
                 "trap cleanup EXIT",
                 f"cd {{shlex.quote(str(workdir))}}",
                 f"cat > {{shlex.quote(str(lease_path))}} <<'JSON'",
