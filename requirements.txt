@@ -14,8 +14,10 @@ pre-commit==3.7.1
 scikit-learn==1.5.2
 scipy==1.17.1
 signax==0.1.1
-# Match the published slinoss CUDA release wheel for Linux x86_64 / CPython 3.11.
+# Match the published slinoss CUDA release wheel for Linux x86_64.
 torch==2.10.0
-slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.2.0/slinoss-0.2.0-cp311-cp311-linux_x86_64.whl#sha256=c3211efe8e30c5c54d9179857834c59215f7a5b4a0174cdf0ead707c922cb4b8
+slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.3.0/slinoss-0.3.0-cp311-cp311-linux_x86_64.whl ; python_version == "3.11"
+slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.3.0/slinoss-0.3.0-cp312-cp312-linux_x86_64.whl ; python_version == "3.12"
+slinoss[cuda] @ https://github.com/b-vitamins/slinoss/releases/download/v0.3.0/slinoss-0.3.0-cp313-cp313-linux_x86_64.whl ; python_version == "3.13"
 sktime==0.30.1
 tqdm==4.66.4
