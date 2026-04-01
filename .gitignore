@@ -6,6 +6,7 @@ __pycache__/
 .remote-known-hosts
 .agent-smokes/
 .remote-state/
+.codex
 remote-downloads/
 
 #Data files
@@ -19,3 +20,6 @@ experiment_configs/repeats/logs/
 
 #Smoke
 sweep_slinoss/smoke_timing.py
+
+#run tracking
+REMOTE_RUN_TRACKER.md
