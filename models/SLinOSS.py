@@ -147,7 +147,6 @@ class BatchNormEMA(nn.Module):
         normalized = (stats_x - mean) / torch.sqrt(var + self.eps)
         return normalized.to(dtype=x.dtype).reshape(batch, timesteps, channels)
 
-
 class SiLUFeedForward(nn.Module):
     """Two-layer feed-forward network with SiLU activations."""
 
@@ -280,6 +279,7 @@ class SLinOSSBlock(nn.Module):
             eps=eps,
             normalize_bc=True,
         )
+        self.post_mixer_norm = BatchNormEMA(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.feed_forward = SiLUFeedForward(
             d_model,
@@ -292,6 +292,7 @@ class SLinOSSBlock(nn.Module):
         residual = x
         x = self.norm(x)
         x = self.mixer(x)
+        x = self.post_mixer_norm(x)
         x = F.silu(x)
         x = self.dropout1(x)
         x = self.feed_forward(x)
