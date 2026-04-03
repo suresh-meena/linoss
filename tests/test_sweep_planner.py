@@ -85,7 +85,7 @@ def test_build_sweep_plan_and_shard_selection(tmp_path) -> None:
 
     tier_groups = select_groups(plan, resource_tiers={"ada6000"})
     assert len(tier_groups) == 2
-    assert all(len(group.trials) == 1 for group in tier_groups)
+    assert all(len(group.trials) == 4 for group in tier_groups)
     assert all(trial.resource_tier == "ada6000" for group in tier_groups for trial in group.trials)
 
 

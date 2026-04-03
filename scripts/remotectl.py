@@ -352,23 +352,25 @@ def _toolchain_error(*tools: str) -> RemoteConfigError:
     )
 
 
-def command_prefix(*tools: str) -> list[str]:
+def command_prefix(*tools: str, allow_missing: bool = False) -> list[str]:
     mode = toolchain_mode()
     if mode == "system":
-        if not _have_system_tools(*tools):
-            raise _toolchain_error(*tools)
-        return []
+        if allow_missing or _have_system_tools(*tools):
+            return []
+        raise _toolchain_error(*tools)
     if mode == "guix":
-        if not _have_guix_toolchain():
-            raise RemoteConfigError(
-                f"KD_REMOTE_TOOLCHAIN=guix requires `guix` on PATH and {GUIX_RUN}"
-            )
-        return [str(GUIX_RUN)]
+        if _have_guix_toolchain() or allow_missing:
+            return [str(GUIX_RUN)]
+        raise RemoteConfigError(
+            f"KD_REMOTE_TOOLCHAIN=guix requires `guix` on PATH and {GUIX_RUN}"
+        )
 
     if _have_system_tools(*tools):
         return []
     if _have_guix_toolchain():
         return [str(GUIX_RUN)]
+    if allow_missing:
+        return []
     raise _toolchain_error(*tools)
 
 
@@ -395,11 +397,15 @@ def ssh_command(
     *,
     allocate_tty: bool,
     remote_command: str | None,
+    allow_missing_tools: bool = False,
 ) -> list[str]:
     required_tools = ["ssh"]
     if uses_sshpass(machine):
         required_tools.append("sshpass")
-    command: list[str] = command_prefix(*required_tools)
+    command: list[str] = command_prefix(
+        *required_tools,
+        allow_missing=allow_missing_tools,
+    )
     if uses_sshpass(machine):
         command += ["sshpass", "-e"]
     command.append("ssh")
@@ -422,12 +428,16 @@ def ssh_command(
     return command
 
 
-def rsync_ssh_transport(machine: RemoteMachine) -> str:
+def rsync_ssh_transport(
+    machine: RemoteMachine,
+    *,
+    allow_missing_tools: bool = False,
+) -> str:
     parts: list[str] = []
     required_tools = ["ssh"]
     if uses_sshpass(machine):
         required_tools.append("sshpass")
-    parts += command_prefix(*required_tools)
+    parts += command_prefix(*required_tools, allow_missing=allow_missing_tools)
     if uses_sshpass(machine):
         parts += ["sshpass", "-e"]
     parts += [
@@ -846,7 +856,12 @@ def _probe_gpu_status_machine(
         require_workdir=False,
     )
     completed = run_command_capture(
-        ssh_command(machine, allocate_tty=False, remote_command=remote_command),
+        ssh_command(
+            machine,
+            allocate_tty=False,
+            remote_command=remote_command,
+            allow_missing_tools=dry_run,
+        ),
         machine=machine,
         dry_run=dry_run,
     )
@@ -1234,7 +1249,12 @@ def command_shell(args: argparse.Namespace) -> int:
         workdir=workdir,
     )
     return run_command(
-        ssh_command(machine, allocate_tty=allocate_tty, remote_command=remote_command),
+        ssh_command(
+            machine,
+            allocate_tty=allocate_tty,
+            remote_command=remote_command,
+            allow_missing_tools=args.dry_run,
+        ),
         machine=machine,
         dry_run=args.dry_run,
     )
@@ -1273,6 +1293,7 @@ def ensure_remote_directory(machine: RemoteMachine, path: str, *, dry_run: bool)
             machine,
             allocate_tty=False,
             remote_command=remote_command,
+            allow_missing_tools=dry_run,
         ),
         machine=machine,
         dry_run=dry_run,
@@ -1286,9 +1307,13 @@ def _build_rsync_command(
     source: str,
     dest: str,
     delete: bool,
+    allow_missing_tools: bool,
     extra_args: list[str] | None = None,
 ) -> list[str]:
-    command: list[str] = command_prefix("rsync") + ["rsync", "-az"]
+    command: list[str] = command_prefix("rsync", allow_missing=allow_missing_tools) + [
+        "rsync",
+        "-az",
+    ]
     if delete:
         command.append("--delete")
     if extra_args:
@@ -1296,7 +1321,10 @@ def _build_rsync_command(
     if direction == "upload":
         for pattern in upload_excludes():
             command += ["--exclude", pattern]
-    command += ["-e", rsync_ssh_transport(machine)]
+    command += [
+        "-e",
+        rsync_ssh_transport(machine, allow_missing_tools=allow_missing_tools),
+    ]
     if direction == "upload":
         command += [source, f"{machine.target}:{dest}"]
     else:
@@ -1343,6 +1371,7 @@ def _rsync_one(machine: RemoteMachine, args: argparse.Namespace) -> CommandResul
             source=source,
             dest=dest,
             delete=args.delete,
+            allow_missing_tools=args.dry_run,
         )
     else:
         command = _build_rsync_command(
@@ -1351,6 +1380,7 @@ def _rsync_one(machine: RemoteMachine, args: argparse.Namespace) -> CommandResul
             source=source,
             dest=dest,
             delete=args.delete,
+            allow_missing_tools=args.dry_run,
         )
 
     completed = run_command_capture(command, machine=machine, dry_run=args.dry_run)
@@ -1408,7 +1438,12 @@ def _smoke_one(machine: RemoteMachine, *, dry_run: bool) -> CommandResult:
         require_workdir=machine.workdir is not None,
     )
     completed = run_command_capture(
-        ssh_command(machine, allocate_tty=False, remote_command=remote_command),
+        ssh_command(
+            machine,
+            allocate_tty=False,
+            remote_command=remote_command,
+            allow_missing_tools=dry_run,
+        ),
         machine=machine,
         dry_run=dry_run,
     )
@@ -1623,7 +1658,10 @@ def command_for_each(args: argparse.Namespace) -> int:
         )
         completed = run_command_capture(
             ssh_command(
-                machine, allocate_tty=allocate_tty, remote_command=remote_command
+                machine,
+                allocate_tty=allocate_tty,
+                remote_command=remote_command,
+                allow_missing_tools=args.dry_run,
             ),
             machine=machine,
             dry_run=args.dry_run,
@@ -1676,7 +1714,12 @@ def command_lease(args: argparse.Namespace) -> int:
             force=args.force,
         )
         completed = run_command_capture(
-            ssh_command(machine, allocate_tty=False, remote_command=remote_command),
+            ssh_command(
+                machine,
+                allocate_tty=False,
+                remote_command=remote_command,
+                allow_missing_tools=args.dry_run,
+            ),
             machine=machine,
             dry_run=args.dry_run,
         )
@@ -1774,7 +1817,12 @@ def command_setup(args: argparse.Namespace) -> int:
             require_workdir=True,
         )
         completed = run_command_capture(
-            ssh_command(machine, allocate_tty=False, remote_command=remote_command),
+            ssh_command(
+                machine,
+                allocate_tty=False,
+                remote_command=remote_command,
+                allow_missing_tools=args.dry_run,
+            ),
             machine=machine,
             dry_run=args.dry_run,
         )
@@ -1823,6 +1871,7 @@ def command_collect(args: argparse.Namespace) -> int:
             source=source,
             dest=str(dest) + "/",
             delete=False,
+            allow_missing_tools=args.dry_run,
             extra_args=_collect_include_args(args.include_logs),
         )
         completed = run_command_capture(command, machine=machine, dry_run=args.dry_run)
@@ -2065,7 +2114,12 @@ def command_sweep_run(args: argparse.Namespace) -> int:
         require_workdir=True,
     )
     completed = run_command_capture(
-        ssh_command(machine, allocate_tty=False, remote_command=remote_command),
+        ssh_command(
+            machine,
+            allocate_tty=False,
+            remote_command=remote_command,
+            allow_missing_tools=args.dry_run,
+        ),
         machine=machine,
         dry_run=args.dry_run,
     )
