@@ -402,12 +402,170 @@ def _close_iterator(iterator) -> None:
         close()
 
 
+def _iter_tensors(value: Any, *, path: str):
+    if isinstance(value, torch.Tensor):
+        yield path, value
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            yield from _iter_tensors(item, path=f"{path}[{key!r}]")
+        return
+    if isinstance(value, tuple):
+        for index, item in enumerate(value):
+            yield from _iter_tensors(item, path=f"{path}[{index}]")
+        return
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            yield from _iter_tensors(item, path=f"{path}[{index}]")
+
+
 def _first_nonfinite_index(tensor: torch.Tensor) -> tuple[int, ...] | None:
     finite_mask = torch.isfinite(tensor)
     if bool(finite_mask.all()):
         return None
     bad = (~finite_mask).nonzero(as_tuple=False)
     return tuple(int(i) for i in bad[0].tolist())
+
+
+def _summarize_nonfinite_tensor(
+    tensor: torch.Tensor,
+    *,
+    path: str,
+    bad_index: tuple[int, ...],
+) -> str:
+    detached = tensor.detach()
+    if bad_index:
+        bad_value = detached[bad_index].item()
+    else:
+        bad_value = detached.item()
+
+    nan_count = 0
+    posinf_count = 0
+    neginf_count = 0
+    if detached.is_floating_point():
+        nan_count = int(torch.isnan(detached).sum().item())
+        posinf_count = int(torch.isposinf(detached).sum().item())
+        neginf_count = int(torch.isneginf(detached).sum().item())
+
+    return (
+        f"{path}: shape={tuple(detached.shape)}, dtype={detached.dtype}, "
+        f"device={detached.device}, first_bad_index={bad_index}, "
+        f"first_bad_value={bad_value!r}, nan_count={nan_count}, "
+        f"posinf_count={posinf_count}, neginf_count={neginf_count}"
+    )
+
+
+def _describe_first_nonfinite_in_structure(value: Any, *, label: str) -> str | None:
+    for path, tensor in _iter_tensors(value, path=label):
+        bad_index = _first_nonfinite_index(tensor)
+        if bad_index is not None:
+            return _summarize_nonfinite_tensor(
+                tensor,
+                path=path,
+                bad_index=bad_index,
+            )
+    return None
+
+
+def _format_module_label(name: str, module: torch.nn.Module | None) -> str:
+    module_name = name or "<root>"
+    if module is None:
+        return module_name
+    return f"{module_name} ({module.__class__.__name__})"
+
+
+def _describe_nonfinite_named_tensors(
+    named_tensors,
+    *,
+    kind: str,
+    model: torch.nn.Module,
+    max_items: int = 3,
+) -> str | None:
+    module_lookup = dict(model.named_modules())
+    issues: list[str] = []
+    for name, tensor in named_tensors:
+        if tensor is None:
+            continue
+        bad_index = _first_nonfinite_index(tensor)
+        if bad_index is None:
+            continue
+        owner_name, _, _ = name.rpartition(".")
+        owner_label = _format_module_label(owner_name, module_lookup.get(owner_name))
+        issues.append(
+            f"{kind} {name} in {owner_label}; "
+            f"{_summarize_nonfinite_tensor(tensor, path='tensor', bad_index=bad_index)}"
+        )
+        if len(issues) >= max_items:
+            break
+    if not issues:
+        return None
+    return "; ".join(issues)
+
+
+def _describe_nonfinite_parameters(
+    model: torch.nn.Module,
+    *,
+    max_items: int = 3,
+) -> str | None:
+    return _describe_nonfinite_named_tensors(
+        ((name, parameter) for name, parameter in model.named_parameters()),
+        kind="parameter",
+        model=model,
+        max_items=max_items,
+    )
+
+
+def _describe_nonfinite_gradients(
+    model: torch.nn.Module,
+    *,
+    max_items: int = 3,
+) -> str | None:
+    return _describe_nonfinite_named_tensors(
+        (
+            (name, parameter.grad)
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        ),
+        kind="gradient",
+        model=model,
+        max_items=max_items,
+    )
+
+
+class _ForwardNonfiniteTracker:
+    def __init__(self, model: torch.nn.Module) -> None:
+        self._first_summary: str | None = None
+        self._handles: list[Any] = []
+        for name, module in model.named_modules():
+            if name == "" or isinstance(module, torch.nn.ModuleList):
+                continue
+            self._handles.append(module.register_forward_hook(self._make_hook(name)))
+
+    def _make_hook(self, name: str):
+        def hook(module, inputs, output) -> None:
+            del inputs
+            if self._first_summary is not None:
+                return
+            summary = _describe_first_nonfinite_in_structure(output, label="output")
+            if summary is None:
+                return
+            self._first_summary = (
+                "First module with non-finite forward output: "
+                f"{_format_module_label(name, module)}; {summary}"
+            )
+
+        return hook
+
+    def reset(self) -> None:
+        self._first_summary = None
+
+    def summary(self) -> str | None:
+        return self._first_summary
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles.clear()
 
 
 @torch.no_grad()
@@ -761,6 +919,9 @@ def train_torch_model(
     no_val_improvement = 0
     all_time = []
     start = time.time()
+    forward_nonfinite_tracker = (
+        _ForwardNonfiniteTracker(model) if check_numerics else None
+    )
 
     try:
         for step in range(num_steps):
@@ -782,6 +943,8 @@ def train_torch_model(
                     )
 
             optimizer.zero_grad(set_to_none=True)
+            if forward_nonfinite_tracker is not None:
+                forward_nonfinite_tracker.reset()
             with torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=use_amp
             ):
@@ -789,47 +952,74 @@ def train_torch_model(
                 if check_numerics:
                     bad_logits = _first_nonfinite_index(logits)
                     if bad_logits is not None:
+                        details: list[str] = []
+                        module_summary = forward_nonfinite_tracker.summary()
+                        if module_summary is not None:
+                            details.append(module_summary)
+                        parameter_summary = _describe_nonfinite_parameters(model)
+                        if parameter_summary is not None:
+                            details.append(
+                                "Non-finite parameter values already present: "
+                                f"{parameter_summary}"
+                            )
+                        detail_suffix = ""
+                        if details:
+                            detail_suffix = " " + " ".join(details)
                         raise FloatingPointError(
                             "Encountered non-finite model logits "
                             f"at training step {step + 1}, tensor index {bad_logits}."
+                            f"{detail_suffix}"
                         )
 
                 loss = F.cross_entropy(logits, labels)
             if check_numerics and not bool(torch.isfinite(loss)):
                 loss_value = float(loss.detach().item())
+                parameter_summary = _describe_nonfinite_parameters(model)
+                detail_suffix = ""
+                if parameter_summary is not None:
+                    detail_suffix = (
+                        " Non-finite parameter values already present: "
+                        f"{parameter_summary}"
+                    )
                 raise FloatingPointError(
                     "Encountered non-finite loss "
                     f"at training step {step + 1}: loss={loss_value}."
+                    f"{detail_suffix}"
                 )
 
             if use_amp:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                if grad_clip_norm is not None:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        max_norm=grad_clip_norm,
-                    )
-                else:
-                    grad_norm = torch.zeros((), device=device, dtype=torch.float32)
             else:
                 loss.backward()
-                if grad_clip_norm is not None:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        max_norm=grad_clip_norm,
+            gradient_summary = None
+            if check_numerics:
+                gradient_summary = _describe_nonfinite_gradients(model)
+                if gradient_summary is not None:
+                    raise FloatingPointError(
+                        "Encountered non-finite gradients "
+                        f"at training step {step + 1}: {gradient_summary}."
                     )
-                else:
-                    grad_norm = torch.zeros((), device=device, dtype=torch.float32)
+            if grad_clip_norm is not None:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    max_norm=grad_clip_norm,
+                )
+            else:
+                grad_norm = torch.zeros((), device=device, dtype=torch.float32)
             if (
                 check_numerics
                 and grad_clip_norm is not None
                 and not bool(torch.isfinite(grad_norm))
             ):
                 grad_norm_value = float(grad_norm.detach().item())
+                detail_suffix = ""
+                if gradient_summary is not None:
+                    detail_suffix = f" {gradient_summary}"
                 raise FloatingPointError(
                     "Encountered non-finite gradient norm "
                     f"at training step {step + 1}: grad_norm={grad_norm_value}."
+                    f"{detail_suffix}"
                 )
 
             if use_amp:
@@ -837,6 +1027,14 @@ def train_torch_model(
                 scaler.update()
             else:
                 optimizer.step()
+            if check_numerics:
+                parameter_summary = _describe_nonfinite_parameters(model)
+                if parameter_summary is not None:
+                    raise FloatingPointError(
+                        "Encountered non-finite parameter values immediately after "
+                        f"optimizer step at training step {step + 1}: "
+                        f"{parameter_summary}."
+                    )
             running_loss += loss.detach().to(dtype=running_loss.dtype)
 
             if (step + 1) % print_steps != 0:
@@ -940,6 +1138,8 @@ def train_torch_model(
         del test_loader
         del optimizer
         del scaler
+        if forward_nonfinite_tracker is not None:
+            forward_nonfinite_tracker.close()
         if owns_logger:
             logger.close()
 
