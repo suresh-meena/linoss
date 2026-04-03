@@ -469,9 +469,25 @@ def _describe_first_nonfinite_in_structure(value: Any, *, label: str) -> str | N
 
 def _format_module_label(name: str, module: torch.nn.Module | None) -> str:
     module_name = name or "<root>"
-    if module is None:
-        return module_name
-    return f"{module_name} ({module.__class__.__name__})"
+    label = module_name
+    if module is not None:
+        label = f"{module_name} ({module.__class__.__name__})"
+    location = _module_location_hint(module_name)
+    if location is None:
+        return label
+    return f"{label} [{location}]"
+
+
+def _module_location_hint(module_name: str) -> str | None:
+    parts = module_name.split(".")
+    if len(parts) < 2 or parts[0] != "blocks" or not parts[1].isdigit():
+        return None
+
+    layer_index = int(parts[1])
+    component = "block"
+    if len(parts) >= 3:
+        component = parts[2]
+    return f"layer={layer_index}, component={component}"
 
 
 def _describe_nonfinite_named_tensors(
@@ -535,37 +551,104 @@ def _describe_nonfinite_gradients(
 class _ForwardNonfiniteTracker:
     def __init__(self, model: torch.nn.Module) -> None:
         self._first_summary: str | None = None
+        self._last_entered_label: str | None = None
+        self._module_stack: list[str] = []
         self._handles: list[Any] = []
+        self._module_lookup = dict(model.named_modules())
         for name, module in model.named_modules():
             if name == "" or isinstance(module, torch.nn.ModuleList):
                 continue
-            self._handles.append(module.register_forward_hook(self._make_hook(name)))
+            self._handles.append(module.register_forward_pre_hook(self._make_pre_hook(name)))
+            self._handles.append(self._register_forward_hook(module, name))
+
+    def _register_forward_hook(self, module: torch.nn.Module, name: str):
+        hook = self._make_hook(name)
+        try:
+            return module.register_forward_hook(hook, always_call=True)
+        except TypeError:
+            # Older torch versions do not support always_call.
+            return module.register_forward_hook(hook)
+
+    def _make_pre_hook(self, name: str):
+        def hook(module, inputs) -> None:
+            del inputs
+            self._module_stack.append(name)
+            self._last_entered_label = _format_module_label(name, module)
+
+        return hook
+
+    def _remove_from_stack(self, name: str) -> None:
+        if not self._module_stack:
+            return
+        if self._module_stack[-1] == name:
+            self._module_stack.pop()
+            return
+        for index in range(len(self._module_stack) - 1, -1, -1):
+            if self._module_stack[index] == name:
+                del self._module_stack[index]
+                return
 
     def _make_hook(self, name: str):
         def hook(module, inputs, output) -> None:
             del inputs
-            if self._first_summary is not None:
-                return
-            summary = _describe_first_nonfinite_in_structure(output, label="output")
-            if summary is None:
-                return
-            self._first_summary = (
-                "First module with non-finite forward output: "
-                f"{_format_module_label(name, module)}; {summary}"
-            )
+            try:
+                if self._first_summary is not None:
+                    return
+                summary = _describe_first_nonfinite_in_structure(output, label="output")
+                if summary is None:
+                    return
+                self._first_summary = (
+                    "First module with non-finite forward output: "
+                    f"{_format_module_label(name, module)}; {summary}"
+                )
+            finally:
+                self._remove_from_stack(name)
 
         return hook
 
     def reset(self) -> None:
         self._first_summary = None
+        self._last_entered_label = None
+        self._module_stack.clear()
 
     def summary(self) -> str | None:
         return self._first_summary
+
+    def last_entered_summary(self) -> str | None:
+        if self._module_stack:
+            name = self._module_stack[-1]
+            module = self._module_lookup.get(name)
+            return (
+                "Last entered forward module before failure: "
+                f"{_format_module_label(name, module)}"
+            )
+        if self._last_entered_label is None:
+            return None
+        return (
+            "Last entered forward module before failure: "
+            f"{self._last_entered_label}"
+        )
 
     def close(self) -> None:
         for handle in self._handles:
             handle.remove()
         self._handles.clear()
+
+
+def _collect_forward_numerics_details(
+    tracker: _ForwardNonfiniteTracker | None,
+) -> list[str]:
+    if tracker is None:
+        return []
+
+    details: list[str] = []
+    last_entered = tracker.last_entered_summary()
+    if last_entered is not None:
+        details.append(last_entered)
+    first_nonfinite = tracker.summary()
+    if first_nonfinite is not None:
+        details.append(first_nonfinite)
+    return details
 
 
 @torch.no_grad()
@@ -948,14 +1031,25 @@ def train_torch_model(
             with torch.autocast(
                 device_type=device.type, dtype=torch.float16, enabled=use_amp
             ):
-                logits = model(x, lengths)
+                try:
+                    logits = model(x, lengths)
+                except Exception as exc:
+                    if not check_numerics:
+                        raise
+                    details = _collect_forward_numerics_details(forward_nonfinite_tracker)
+                    detail_suffix = ""
+                    if details:
+                        detail_suffix = " " + " ".join(details)
+                    raise FloatingPointError(
+                        "Model forward pass failed "
+                        f"at training step {step + 1}.{detail_suffix}"
+                    ) from exc
                 if check_numerics:
                     bad_logits = _first_nonfinite_index(logits)
                     if bad_logits is not None:
-                        details: list[str] = []
-                        module_summary = forward_nonfinite_tracker.summary()
-                        if module_summary is not None:
-                            details.append(module_summary)
+                        details = _collect_forward_numerics_details(
+                            forward_nonfinite_tracker
+                        )
                         parameter_summary = _describe_nonfinite_parameters(model)
                         if parameter_summary is not None:
                             details.append(
@@ -974,13 +1068,16 @@ def train_torch_model(
                 loss = F.cross_entropy(logits, labels)
             if check_numerics and not bool(torch.isfinite(loss)):
                 loss_value = float(loss.detach().item())
+                details = _collect_forward_numerics_details(forward_nonfinite_tracker)
                 parameter_summary = _describe_nonfinite_parameters(model)
                 detail_suffix = ""
                 if parameter_summary is not None:
-                    detail_suffix = (
-                        " Non-finite parameter values already present: "
+                    details.append(
+                        "Non-finite parameter values already present: "
                         f"{parameter_summary}"
                     )
+                if details:
+                    detail_suffix = " " + " ".join(details)
                 raise FloatingPointError(
                     "Encountered non-finite loss "
                     f"at training step {step + 1}: loss={loss_value}."
@@ -996,9 +1093,11 @@ def train_torch_model(
             if check_numerics:
                 gradient_summary = _describe_nonfinite_gradients(model)
                 if gradient_summary is not None:
+                    details = _collect_forward_numerics_details(forward_nonfinite_tracker)
+                    details.append(gradient_summary)
                     raise FloatingPointError(
                         "Encountered non-finite gradients "
-                        f"at training step {step + 1}: {gradient_summary}."
+                        f"at training step {step + 1}: {' '.join(details)}."
                     )
             if grad_clip_norm is not None:
                 grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -1013,9 +1112,12 @@ def train_torch_model(
                 and not bool(torch.isfinite(grad_norm))
             ):
                 grad_norm_value = float(grad_norm.detach().item())
-                detail_suffix = ""
+                details = _collect_forward_numerics_details(forward_nonfinite_tracker)
                 if gradient_summary is not None:
-                    detail_suffix = f" {gradient_summary}"
+                    details.append(gradient_summary)
+                detail_suffix = ""
+                if details:
+                    detail_suffix = " " + " ".join(details)
                 raise FloatingPointError(
                     "Encountered non-finite gradient norm "
                     f"at training step {step + 1}: grad_norm={grad_norm_value}."
@@ -1030,10 +1132,12 @@ def train_torch_model(
             if check_numerics:
                 parameter_summary = _describe_nonfinite_parameters(model)
                 if parameter_summary is not None:
+                    details = _collect_forward_numerics_details(forward_nonfinite_tracker)
+                    details.append(parameter_summary)
                     raise FloatingPointError(
                         "Encountered non-finite parameter values immediately after "
                         f"optimizer step at training step {step + 1}: "
-                        f"{parameter_summary}."
+                        f"{' '.join(details)}."
                     )
             running_loss += loss.detach().to(dtype=running_loss.dtype)
 
