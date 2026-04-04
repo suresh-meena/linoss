@@ -19,6 +19,7 @@ SCRIPTS = [
     ROOT / "scripts" / "remote-lease",
     ROOT / "scripts" / "remote-setup",
     ROOT / "scripts" / "remote-collect",
+    ROOT / "scripts" / "remote-audit",
     ROOT / "scripts" / "remote-sweep-run",
     ROOT / "scripts" / "remote-sweep-status",
 ]
@@ -323,7 +324,8 @@ def test_remote_setup_and_collect_dry_run_include_expected_commands(
         env_file=env_file,
     )
     assert "mkdir -p /scratch/kdrifting" in setup.stdout
-    assert ".venv/bin/pip install -r requirements.txt" in setup.stdout
+    assert ".venv.tmp/bin/pip install -r requirements.txt" in setup.stdout
+    assert "mv .venv.tmp .venv" in setup.stdout
     assert "test -e data_dir/processed/UEA" in setup.stdout
 
     collect = _run_script(
@@ -388,6 +390,66 @@ def test_remote_sweep_run_dry_run_enforces_single_visible_gpu_pattern(
     assert "rtx3050-6gb" in result.stdout
     assert "--shard" in result.stdout
     assert "1/18" in result.stdout
+    assert "PYTORCH_ALLOC_CONF" in result.stdout
+
+
+def test_remote_sweep_run_dry_run_can_disable_pytorch_env_and_enable_shm_cleanup(
+    tmp_path: Path,
+) -> None:
+    env_file = _write_remote_env(tmp_path)
+    config_path = tmp_path / "toy_sweep.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "name": "toy-sweep",
+                "datasets": [{"name": "ToyDataset", "seeds": [1234]}],
+                "defaults": {
+                    "dataset": {"data_dir": "data_dir"},
+                    "training": {"batch_size": 4},
+                    "model": {"d_model": 16, "n_layers": 2},
+                },
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    result = _run_script(
+        "remote-sweep-run",
+        "--machine",
+        "scratch-box",
+        "--gpu",
+        "0",
+        "--config",
+        str(config_path),
+        "--dry-run",
+        env_file=env_file,
+        extra_env={
+            "KD_REMOTE_ENABLE_PYTORCH_ALLOC_CONF": "0",
+            "KD_REMOTE_CLEAN_DEV_SHM": "1",
+        },
+    )
+    assert "find /dev/shm" in result.stdout
+    assert "torch_*" in result.stdout
+
+
+def test_remote_audit_dry_run_emits_remote_command(tmp_path: Path) -> None:
+    env_file = _write_remote_env(tmp_path)
+    result = _run_script(
+        "remote-audit",
+        "--machine",
+        "scratch-box",
+        "--sweep",
+        "toy-sweep",
+        "--kill-orphans",
+        "--dry-run",
+        env_file=env_file,
+    )
+    assert "alice@dgx.example.edu" not in result.stdout
+    assert "bob@10.0.0.5" in result.stdout
+    assert ".remote-jobs" in result.stdout
+    assert "kill_orphans" in result.stdout
 
 
 def test_remote_sweep_status_reads_collected_canonical_cache(tmp_path: Path) -> None:
@@ -404,3 +466,33 @@ def test_remote_sweep_status_reads_collected_canonical_cache(tmp_path: Path) -> 
     assert "sweep=toy-sweep" in result.stdout
     assert "total=2 success=1 failed=0 pending=1" in result.stdout
     assert "dataset=ToyDataset total=2 success=1 failed=0 pending=1" in result.stdout
+
+
+def test_remote_sweep_status_treats_invalid_result_json_as_failed(
+    tmp_path: Path,
+) -> None:
+    env_file = _write_remote_env(tmp_path)
+    state_dir = tmp_path / "state"
+    config_path = _write_sweep_fixture(tmp_path, state_dir)
+    bad_result = (
+        state_dir
+        / "sweeps"
+        / "toy-sweep"
+        / "canonical"
+        / "trials"
+        / "ToyDataset"
+        / "family-aaa"
+        / "seed-1234"
+        / "result.json"
+    )
+    bad_result.write_text("{", encoding="utf-8")
+    result = _run_script(
+        "remote-sweep-status",
+        "--config",
+        str(config_path),
+        env_file=env_file,
+        extra_env={"KD_REMOTE_STATE_DIR": str(state_dir)},
+    )
+    assert "sweep=toy-sweep" in result.stdout
+    assert "total=2 success=0 failed=1 pending=1" in result.stdout
+    assert "dataset=ToyDataset total=2 success=0 failed=1 pending=1" in result.stdout

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import errno
 import io
 import json
 import os
@@ -10,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import textwrap
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
@@ -22,7 +24,17 @@ KNOWN_HOSTS_FILE = ROOT / ".remote-known-hosts"
 DEFAULT_STATE_DIR = ROOT / ".remote-state"
 DEFAULT_LEASE_ROOT = "/tmp/linoss-agent-leases"
 DEFAULT_FANOUT_PARALLELISM = 4
+DEFAULT_SSH_CONNECT_TIMEOUT_SEC = 10
+DEFAULT_SSH_SERVER_ALIVE_INTERVAL_SEC = 15
+DEFAULT_SSH_SERVER_ALIVE_COUNT_MAX = 3
+DEFAULT_PROBE_TIMEOUT_SEC = 15.0
+DEFAULT_MIN_FREE_DISK_GIB = 5.0
+DEFAULT_LEASE_LOCK_WAIT_SEC = 5.0
+DEFAULT_LEASE_LOCK_STALE_SEC = 300.0
+DEFAULT_STATE_LOCK_WAIT_SEC = 10.0
+DEFAULT_STATE_LOCK_STALE_SEC = 300.0
 VALID_TOOLCHAIN_MODES = {"auto", "system", "guix"}
+VALID_STATE_LOCK_MODES = {"auto", "mkdir", "flock"}
 
 
 class RemoteConfigError(RuntimeError):
@@ -227,6 +239,95 @@ def _parse_optional_float(
         ) from exc
 
 
+def _parse_env_float(
+    env: dict[str, str], key: str, *, default: float, minimum: float = 0.0
+) -> float:
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RemoteConfigError(f"invalid float for {key}: {raw!r}") from exc
+    if value < minimum:
+        raise RemoteConfigError(f"{key} must be >= {minimum:g}, got {value:g}")
+    return value
+
+
+def _parse_env_bool(env: dict[str, str], key: str, *, default: bool) -> bool:
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise RemoteConfigError(f"invalid boolean for {key}: {raw!r}")
+
+
+def probe_timeout_seconds(env: dict[str, str]) -> float:
+    return _parse_env_float(
+        env,
+        "KD_REMOTE_PROBE_TIMEOUT_SEC",
+        default=DEFAULT_PROBE_TIMEOUT_SEC,
+        minimum=1.0,
+    )
+
+
+def min_free_disk_gib(env: dict[str, str]) -> float:
+    return _parse_env_float(
+        env,
+        "KD_REMOTE_MIN_FREE_DISK_GIB",
+        default=DEFAULT_MIN_FREE_DISK_GIB,
+        minimum=0.0,
+    )
+
+
+def state_lock_wait_seconds(env: dict[str, str]) -> float:
+    return _parse_env_float(
+        env,
+        "KD_REMOTE_STATE_LOCK_WAIT_SEC",
+        default=DEFAULT_STATE_LOCK_WAIT_SEC,
+        minimum=0.1,
+    )
+
+
+def state_lock_stale_seconds(env: dict[str, str]) -> float:
+    return _parse_env_float(
+        env,
+        "KD_REMOTE_STATE_LOCK_STALE_SEC",
+        default=DEFAULT_STATE_LOCK_STALE_SEC,
+        minimum=1.0,
+    )
+
+
+def state_lock_mode(env: dict[str, str]) -> str:
+    mode = env.get("KD_REMOTE_STATE_LOCK_MODE", "auto").strip().lower()
+    if mode not in VALID_STATE_LOCK_MODES:
+        allowed = ", ".join(sorted(VALID_STATE_LOCK_MODES))
+        raise RemoteConfigError(
+            f"invalid KD_REMOTE_STATE_LOCK_MODE={mode!r}; expected one of: {allowed}"
+        )
+    return mode
+
+
+def launcher_enable_pytorch_allocator(env: dict[str, str]) -> bool:
+    return _parse_env_bool(
+        env,
+        "KD_REMOTE_ENABLE_PYTORCH_ALLOC_CONF",
+        default=True,
+    )
+
+
+def launcher_cleanup_shm(env: dict[str, str]) -> bool:
+    return _parse_env_bool(
+        env,
+        "KD_REMOTE_CLEAN_DEV_SHM",
+        default=False,
+    )
+
+
 def resolve_machine(env: dict[str, str], requested: str | None) -> RemoteMachine:
     name = resolve_machine_name(env, requested)
     host = require_machine_field(env, name, "HOST")
@@ -418,6 +519,12 @@ def ssh_command(
         "VisualHostKey=no",
         "-o",
         f"UserKnownHostsFile={KNOWN_HOSTS_FILE}",
+        "-o",
+        f"ConnectTimeout={DEFAULT_SSH_CONNECT_TIMEOUT_SEC}",
+        "-o",
+        f"ServerAliveInterval={DEFAULT_SSH_SERVER_ALIVE_INTERVAL_SEC}",
+        "-o",
+        f"ServerAliveCountMax={DEFAULT_SSH_SERVER_ALIVE_COUNT_MAX}",
         "-p",
         str(machine.port),
     ]
@@ -448,6 +555,12 @@ def rsync_ssh_transport(
         "VisualHostKey=no",
         "-o",
         f"UserKnownHostsFile={KNOWN_HOSTS_FILE}",
+        "-o",
+        f"ConnectTimeout={DEFAULT_SSH_CONNECT_TIMEOUT_SEC}",
+        "-o",
+        f"ServerAliveInterval={DEFAULT_SSH_SERVER_ALIVE_INTERVAL_SEC}",
+        "-o",
+        f"ServerAliveCountMax={DEFAULT_SSH_SERVER_ALIVE_COUNT_MAX}",
         "-p",
         str(machine.port),
     ]
@@ -460,11 +573,25 @@ def render_command(command: list[str], *, machine: RemoteMachine) -> str:
     return prefix + quoted_command(command)
 
 
-def run_command(command: list[str], *, machine: RemoteMachine, dry_run: bool) -> int:
+def run_command(
+    command: list[str],
+    *,
+    machine: RemoteMachine,
+    dry_run: bool,
+    timeout_seconds: float | None = None,
+) -> int:
     if dry_run:
         print(render_command(command, machine=machine))
         return 0
-    completed = subprocess.run(command, env=prefixed_env(machine), check=False)
+    try:
+        completed = subprocess.run(
+            command,
+            env=prefixed_env(machine),
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        return 124
     return completed.returncode
 
 
@@ -473,6 +600,7 @@ def run_command_capture(
     *,
     machine: RemoteMachine,
     dry_run: bool,
+    timeout_seconds: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     if dry_run:
         return subprocess.CompletedProcess(
@@ -481,13 +609,33 @@ def run_command_capture(
             stdout=render_command(command, machine=machine) + "\n",
             stderr="",
         )
-    return subprocess.run(
-        command,
-        env=prefixed_env(machine),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        return subprocess.run(
+            command,
+            env=prefixed_env(machine),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = (exc.stderr or "").rstrip()
+        timeout_text = (
+            f"command timed out after {timeout_seconds:g}s"
+            if timeout_seconds is not None
+            else "command timed out"
+        )
+        if stderr:
+            stderr = f"{stderr}\n{timeout_text}"
+        else:
+            stderr = timeout_text
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=124,
+            stdout=stdout,
+            stderr=stderr,
+        )
 
 
 def build_remote_script(
@@ -556,6 +704,16 @@ def load_json(path: Path) -> dict[str, Any] | None:
         return json.load(handle)
 
 
+def load_json_safe(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if not path.is_file():
+        return None, None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            return json.load(handle), None
+    except json.JSONDecodeError as exc:
+        return None, f"{path}: invalid json ({exc})"
+
+
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     ensure_parent(path)
     with path.open("w", encoding="utf-8") as handle:
@@ -570,30 +728,219 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         handle.write("\n")
 
 
-def load_state_cache(env: dict[str, str]) -> dict[str, Any]:
-    path = state_dir(env) / "fleet-state.json"
-    payload = load_json(path)
-    if payload is None:
+def _load_json_from_text(raw: str) -> dict[str, Any]:
+    stripped = raw.strip()
+    if not stripped:
         return {"machines": {}}
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        raise RemoteConfigError(f"invalid fleet-state.json: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RemoteConfigError("fleet-state.json must contain a JSON object")
     return payload
 
 
+def _fleet_state_path(env: dict[str, str]) -> Path:
+    return state_dir(env) / "fleet-state.json"
+
+
+def _fleet_state_lock_path(path: Path) -> Path:
+    return path.with_name(path.name + ".lock")
+
+
+def _acquire_mkdir_lock(path: Path, *, wait_seconds: float, stale_seconds: float) -> None:
+    lock_path = _fleet_state_lock_path(path)
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            os.mkdir(lock_path)
+            return
+        except FileExistsError:
+            stale = 0.0
+            try:
+                stale = time.time() - lock_path.stat().st_mtime
+            except OSError:
+                stale = 0.0
+            if stale > stale_seconds:
+                try:
+                    os.rmdir(lock_path)
+                    continue
+                except OSError:
+                    pass
+            if time.monotonic() >= deadline:
+                raise RemoteConfigError(
+                    f"timed out waiting for state lock {lock_path} after {wait_seconds:g}s"
+                )
+            time.sleep(0.05)
+
+
+def _release_mkdir_lock(path: Path) -> None:
+    lock_path = _fleet_state_lock_path(path)
+    try:
+        os.rmdir(lock_path)
+    except OSError:
+        pass
+
+
+def _flock_supported(exc: OSError) -> bool:
+    return exc.errno not in {
+        errno.ENOSYS,
+        errno.ENOTSUP,
+        errno.EOPNOTSUPP,
+        errno.EINVAL,
+    }
+
+
+def _load_state_cache_locked(handle) -> dict[str, Any]:
+    handle.seek(0)
+    payload = _load_json_from_text(handle.read())
+    payload.setdefault("machines", {})
+    return payload
+
+
+def _write_state_cache_locked(handle, payload: dict[str, Any]) -> None:
+    payload.setdefault("machines", {})
+    handle.seek(0)
+    handle.truncate()
+    json.dump(payload, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def load_state_cache(env: dict[str, str]) -> dict[str, Any]:
+    path = _fleet_state_path(env)
+    ensure_parent(path)
+    mode = state_lock_mode(env)
+    if mode == "mkdir":
+        _acquire_mkdir_lock(
+            path,
+            wait_seconds=state_lock_wait_seconds(env),
+            stale_seconds=state_lock_stale_seconds(env),
+        )
+        try:
+            with path.open("a+", encoding="utf-8") as handle:
+                return _load_state_cache_locked(handle)
+        finally:
+            _release_mkdir_lock(path)
+    with path.open("a+", encoding="utf-8") as handle:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH)
+            try:
+                return _load_state_cache_locked(handle)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            if mode == "flock" or _flock_supported(exc):
+                raise
+    _acquire_mkdir_lock(
+        path,
+        wait_seconds=state_lock_wait_seconds(env),
+        stale_seconds=state_lock_stale_seconds(env),
+    )
+    try:
+        with path.open("a+", encoding="utf-8") as handle:
+            return _load_state_cache_locked(handle)
+    finally:
+        _release_mkdir_lock(path)
+
+
 def save_state_cache(env: dict[str, str], payload: dict[str, Any]) -> None:
-    path = state_dir(env) / "fleet-state.json"
-    write_json(path, payload)
+    path = _fleet_state_path(env)
+    ensure_parent(path)
+    mode = state_lock_mode(env)
+    if mode == "mkdir":
+        _acquire_mkdir_lock(
+            path,
+            wait_seconds=state_lock_wait_seconds(env),
+            stale_seconds=state_lock_stale_seconds(env),
+        )
+        try:
+            with path.open("a+", encoding="utf-8") as handle:
+                _write_state_cache_locked(handle, payload)
+            return
+        finally:
+            _release_mkdir_lock(path)
+    with path.open("a+", encoding="utf-8") as handle:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                _write_state_cache_locked(handle, payload)
+                return
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            if mode == "flock" or _flock_supported(exc):
+                raise
+    _acquire_mkdir_lock(
+        path,
+        wait_seconds=state_lock_wait_seconds(env),
+        stale_seconds=state_lock_stale_seconds(env),
+    )
+    try:
+        with path.open("a+", encoding="utf-8") as handle:
+            _write_state_cache_locked(handle, payload)
+    finally:
+        _release_mkdir_lock(path)
 
 
 def update_machine_state(
     env: dict[str, str], machine: RemoteMachine, patch: dict[str, Any]
 ) -> None:
-    payload = load_state_cache(env)
-    machines = payload.setdefault("machines", {})
-    current = dict(machines.get(machine.name, {}))
-    current.update(patch)
-    current["host"] = machine.host
-    current["updated_at"] = iso_now()
-    machines[machine.name] = current
-    save_state_cache(env, payload)
+    path = _fleet_state_path(env)
+    ensure_parent(path)
+    mode = state_lock_mode(env)
+
+    def _write_with_handle(handle) -> None:
+        payload = _load_state_cache_locked(handle)
+        machines = payload.setdefault("machines", {})
+        current = dict(machines.get(machine.name, {}))
+        current.update(patch)
+        current["host"] = machine.host
+        current["updated_at"] = iso_now()
+        machines[machine.name] = current
+        _write_state_cache_locked(handle, payload)
+
+    if mode == "mkdir":
+        _acquire_mkdir_lock(
+            path,
+            wait_seconds=state_lock_wait_seconds(env),
+            stale_seconds=state_lock_stale_seconds(env),
+        )
+        try:
+            with path.open("a+", encoding="utf-8") as handle:
+                _write_with_handle(handle)
+            return
+        finally:
+            _release_mkdir_lock(path)
+    with path.open("a+", encoding="utf-8") as handle:
+        try:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                _write_with_handle(handle)
+                return
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError as exc:
+            if mode == "flock" or _flock_supported(exc):
+                raise
+    _acquire_mkdir_lock(
+        path,
+        wait_seconds=state_lock_wait_seconds(env),
+        stale_seconds=state_lock_stale_seconds(env),
+    )
+    try:
+        with path.open("a+", encoding="utf-8") as handle:
+            _write_with_handle(handle)
+    finally:
+        _release_mkdir_lock(path)
 
 
 def group_membership_text(machine: RemoteMachine) -> str:
@@ -702,6 +1049,7 @@ def _probe_gpu_status_machine(
     machine: RemoteMachine,
     *,
     dry_run: bool,
+    timeout_seconds: float,
 ) -> CommandResult:
     payload = {
         "lease_root": machine.lease_root,
@@ -847,6 +1195,32 @@ def _probe_gpu_status_machine(
             "gpus": gpus,
             "workdir": payload.get("workdir"),
         }}
+        workdir = payload.get("workdir")
+        disk_info = {{"path": workdir, "ok": False, "free_kib": None, "free_gib": None}}
+        if workdir:
+            df_query = run(["df", "-k", str(workdir)])
+            if df_query.returncode == 0 and df_query.stdout.strip():
+                lines = [line for line in df_query.stdout.splitlines() if line.strip()]
+                if len(lines) >= 2:
+                    columns = lines[-1].split()
+                    if len(columns) >= 4:
+                        try:
+                            free_kib = int(columns[3])
+                            disk_info = {{
+                                "path": workdir,
+                                "ok": True,
+                                "free_kib": free_kib,
+                                "free_gib": round(free_kib / (1024.0 * 1024.0), 3),
+                            }}
+                        except ValueError:
+                            disk_info["error"] = "failed to parse df output"
+                    else:
+                        disk_info["error"] = "unexpected df output shape"
+                else:
+                    disk_info["error"] = "df output missing data rows"
+            else:
+                disk_info["error"] = df_query.stderr.strip() or df_query.stdout.strip() or "df failed"
+        payload["disk"] = disk_info
         print(json.dumps(payload, sort_keys=True))
         """
     ).strip()
@@ -864,6 +1238,7 @@ def _probe_gpu_status_machine(
         ),
         machine=machine,
         dry_run=dry_run,
+        timeout_seconds=timeout_seconds,
     )
     return CommandResult(
         machine=machine,
@@ -893,6 +1268,8 @@ def gpu_matches_policy(
     require_idle: bool,
     min_free_vram_gib: float | None,
     ignore_leases: bool,
+    machine_disk: dict[str, Any] | None,
+    min_free_disk_gib: float,
 ) -> tuple[bool, list[str]]:
     reasons: list[str] = []
     if require_idle and gpu.get("compute_apps"):
@@ -903,6 +1280,13 @@ def gpu_matches_policy(
             reasons.append(f"free_vram<{min_free_vram_gib:g}GiB")
     if not ignore_leases and _lease_is_active(gpu.get("lease")):
         reasons.append("leased")
+    if machine_disk and machine_disk.get("ok"):
+        try:
+            free_gib = float(machine_disk.get("free_gib", 0.0))
+        except (TypeError, ValueError):
+            free_gib = 0.0
+        if free_gib + 1e-9 < min_free_disk_gib:
+            reasons.append(f"disk_free<{min_free_disk_gib:g}GiB")
     return (not reasons), reasons
 
 
@@ -916,7 +1300,11 @@ def probe_gpu_status(
     results = fanout(
         machines,
         max_parallel=max_parallel,
-        work=lambda machine: _probe_gpu_status_machine(machine, dry_run=dry_run),
+        work=lambda machine: _probe_gpu_status_machine(
+            machine,
+            dry_run=dry_run,
+            timeout_seconds=probe_timeout_seconds(env),
+        ),
     )
     parsed: list[tuple[RemoteMachine, dict[str, Any] | None, CommandResult]] = []
     for result in results:
@@ -1088,6 +1476,282 @@ def _collect_include_args(include_logs: bool) -> list[str]:
     return includes
 
 
+def _extract_json_payload(result: CommandResult, *, context: str) -> dict[str, Any]:
+    lines = [line for line in result.stdout.splitlines() if line.strip()]
+    if not lines:
+        raise RemoteConfigError(f"no payload returned for {context} on {result.machine.name}")
+    try:
+        payload = json.loads(lines[-1])
+    except json.JSONDecodeError as exc:
+        raise RemoteConfigError(
+            f"failed to parse payload for {context} on {result.machine.name}: {lines[-1]!r}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RemoteConfigError(
+            f"unexpected payload type for {context} on {result.machine.name}: {type(payload).__name__}"
+        )
+    return payload
+
+
+def _known_launch_job_ids(ledger_path: Path, *, sweep_name: str) -> set[str]:
+    if not ledger_path.is_file():
+        return set()
+    known: set[str] = set()
+    with ledger_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("sweep") != sweep_name:
+                continue
+            if payload.get("event") not in {"launch", "launch_reconciled"}:
+                continue
+            job_id = payload.get("job_id")
+            if isinstance(job_id, str) and job_id:
+                known.add(job_id)
+    return known
+
+
+def _query_remote_done_jobs(
+    machine: RemoteMachine, *, sweep_name: str, dry_run: bool, timeout_seconds: float
+) -> CommandResult:
+    if machine.workdir is None:
+        return CommandResult(
+            machine=machine,
+            returncode=2,
+            stderr="query-remote-done-jobs requires WORKDIR",
+        )
+    payload = {"sweep_name": sweep_name}
+    script = textwrap.dedent(
+        f"""
+        import json
+        from pathlib import Path
+
+        payload = json.loads({json.dumps(payload, sort_keys=True)!r})
+        jobs_dir = Path(".remote-jobs") / payload["sweep_name"]
+        jobs = []
+        if jobs_dir.is_dir():
+            for done_path in sorted(jobs_dir.glob("*.done.json")):
+                item = {{
+                    "done_path": str(done_path),
+                    "job_id": done_path.stem.replace(".done", ""),
+                }}
+                try:
+                    parsed = json.loads(done_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        item.update(parsed)
+                    else:
+                        item["invalid"] = True
+                        item["error"] = "payload is not a json object"
+                except json.JSONDecodeError:
+                    item["invalid"] = True
+                    item["error"] = "invalid json"
+                jobs.append(item)
+        print(json.dumps({{"ok": True, "jobs": jobs}}, sort_keys=True))
+        """
+    ).strip()
+    remote_command = build_remote_script(
+        f"python3 - <<'PY'\n{script}\nPY",
+        workdir=machine.workdir,
+        require_workdir=True,
+    )
+    completed = run_command_capture(
+        ssh_command(
+            machine,
+            allocate_tty=False,
+            remote_command=remote_command,
+            allow_missing_tools=dry_run,
+        ),
+        machine=machine,
+        dry_run=dry_run,
+        timeout_seconds=timeout_seconds,
+    )
+    return CommandResult(
+        machine=machine,
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
+def _audit_remote_jobs(
+    machine: RemoteMachine,
+    *,
+    sweep_name: str,
+    kill_orphans: bool,
+    dry_run: bool,
+    timeout_seconds: float,
+) -> CommandResult:
+    if machine.workdir is None:
+        return CommandResult(
+            machine=machine,
+            returncode=2,
+            stderr="remote-audit requires WORKDIR",
+        )
+    payload = {
+        "sweep_name": sweep_name,
+        "workdir": machine.workdir,
+        "kill_orphans": kill_orphans,
+    }
+    script = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import signal
+        from pathlib import Path
+
+        payload = json.loads({json.dumps(payload, sort_keys=True)!r})
+        sweep_name = payload["sweep_name"]
+        workdir = Path(payload["workdir"]).resolve()
+        jobs_dir = workdir / ".remote-jobs" / sweep_name
+        kill_orphans = bool(payload.get("kill_orphans", False))
+
+        def pid_alive(pid):
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
+
+        launches = []
+        active_launch_pids = set()
+        stale_leases_cleared = 0
+        if jobs_dir.is_dir():
+            for done_path in sorted(jobs_dir.glob("*.done.json")):
+                row = {{"done_path": str(done_path), "job_id": done_path.stem.replace(".done", "")}}
+                try:
+                    parsed = json.loads(done_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    row["invalid"] = True
+                    row["error"] = "invalid json"
+                    launches.append(row)
+                    continue
+                if isinstance(parsed, dict):
+                    row.update(parsed)
+                else:
+                    row["invalid"] = True
+                    row["error"] = "payload is not a json object"
+                    launches.append(row)
+                    continue
+                pid_value = row.get("pid")
+                pid = None
+                if isinstance(pid_value, int):
+                    pid = pid_value
+                elif isinstance(pid_value, str) and pid_value.isdigit():
+                    pid = int(pid_value)
+                alive = bool(pid and pid > 0 and pid_alive(pid))
+                row["pid_alive"] = alive
+                if alive and pid is not None:
+                    active_launch_pids.add(pid)
+                if (not alive) and isinstance(row.get("lease_path"), str):
+                    lease_path = Path(row["lease_path"])
+                    if lease_path.exists():
+                        try:
+                            lease_path.unlink()
+                            stale_leases_cleared += 1
+                        except OSError:
+                            pass
+                launches.append(row)
+
+        dead_launches = [
+            {{
+                "job_id": row.get("job_id"),
+                "pid": row.get("pid"),
+                "done_path": row.get("done_path"),
+                "log_path": row.get("log_path"),
+                "lease_path": row.get("lease_path"),
+            }}
+            for row in launches
+            if not row.get("pid_alive", False)
+        ]
+
+        killed_orphans = []
+        if kill_orphans:
+            for proc_dir in Path("/proc").iterdir():
+                if not proc_dir.name.isdigit():
+                    continue
+                pid = int(proc_dir.name)
+                if pid in active_launch_pids:
+                    continue
+                status_path = proc_dir / "status"
+                try:
+                    status_text = status_path.read_text(encoding="utf-8")
+                except OSError:
+                    continue
+                ppid = None
+                for line in status_text.splitlines():
+                    if line.startswith("PPid:"):
+                        try:
+                            ppid = int(line.split(":", 1)[1].strip())
+                        except ValueError:
+                            ppid = None
+                        break
+                if ppid != 1:
+                    continue
+                cwd_path = proc_dir / "cwd"
+                cmdline_path = proc_dir / "cmdline"
+                try:
+                    cwd = Path(os.readlink(cwd_path)).resolve()
+                    cmdline_raw = cmdline_path.read_bytes().replace(b"\\x00", b" ").decode("utf-8", errors="replace")
+                except OSError:
+                    continue
+                if not str(cwd).startswith(str(workdir)):
+                    continue
+                cmdline_lower = cmdline_raw.lower()
+                if ("python" not in cmdline_lower) and ("sweep" not in cmdline_lower):
+                    continue
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    killed_orphans.append({{"pid": pid, "cwd": str(cwd), "cmdline": cmdline_raw}})
+                except OSError:
+                    continue
+
+        print(
+            json.dumps(
+                {{
+                    "ok": True,
+                    "sweep": sweep_name,
+                    "jobs_total": len(launches),
+                    "active_launches": sum(1 for row in launches if row.get("pid_alive", False)),
+                    "dead_launches": dead_launches,
+                    "stale_leases_cleared": stale_leases_cleared,
+                    "killed_orphans": killed_orphans,
+                }},
+                sort_keys=True,
+            )
+        )
+        """
+    ).strip()
+    remote_command = build_remote_script(
+        f"python3 - <<'PY'\n{script}\nPY",
+        workdir=machine.workdir,
+        require_workdir=True,
+    )
+    completed = run_command_capture(
+        ssh_command(
+            machine,
+            allocate_tty=False,
+            remote_command=remote_command,
+            allow_missing_tools=dry_run,
+        ),
+        machine=machine,
+        dry_run=dry_run,
+        timeout_seconds=timeout_seconds,
+    )
+    return CommandResult(
+        machine=machine,
+        returncode=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
+
+
 def _create_lease_payload(
     machine: RemoteMachine,
     *,
@@ -1126,19 +1790,38 @@ def _remote_lease_command(
     script = textwrap.dedent(
         f"""
         import json
+        import os
+        import time
         from datetime import datetime, timezone
         from pathlib import Path
 
         payload = json.loads({json.dumps(script_payload, sort_keys=True)!r})
         lease_path = Path(payload["lease_path"])
         lease_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = Path(str(lease_path) + ".lock")
+        deadline = time.monotonic() + {DEFAULT_LEASE_LOCK_WAIT_SEC}
         action = payload["action"]
-        current = None
-        if lease_path.is_file():
+
+        while True:
             try:
-                current = json.loads(lease_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                current = {{"invalid": True}}
+                os.mkdir(lock_path)
+                break
+            except FileExistsError:
+                stale_seconds = 0.0
+                try:
+                    stale_seconds = time.time() - lock_path.stat().st_mtime
+                except OSError:
+                    stale_seconds = 0.0
+                if stale_seconds > {DEFAULT_LEASE_LOCK_STALE_SEC}:
+                    try:
+                        os.rmdir(lock_path)
+                        continue
+                    except OSError:
+                        pass
+                if time.monotonic() >= deadline:
+                    print(json.dumps({{"acquired": False, "error": "lease lock timeout", "lease_path": str(lease_path)}}, sort_keys=True))
+                    raise SystemExit(4)
+                time.sleep(0.05)
 
         def is_active(value):
             if not isinstance(value, dict):
@@ -1154,34 +1837,47 @@ def _remote_lease_command(
                 parsed = parsed.replace(tzinfo=timezone.utc)
             return parsed > datetime.now(timezone.utc)
 
-        if action == "show":
-            print(json.dumps({{"lease_path": str(lease_path), "lease": current}}, sort_keys=True))
-            raise SystemExit(0)
-        if action == "release":
-            if lease_path.exists():
-                lease_path.unlink()
-            print(json.dumps({{"released": True, "lease_path": str(lease_path)}}, sort_keys=True))
-            raise SystemExit(0)
+        try:
+            current = None
+            if lease_path.is_file():
+                try:
+                    current = json.loads(lease_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    current = {{"invalid": True}}
 
-        if action != "acquire":
-            raise SystemExit(2)
+            if action == "show":
+                print(json.dumps({{"lease_path": str(lease_path), "lease": current}}, sort_keys=True))
+                raise SystemExit(0)
+            if action == "release":
+                if lease_path.exists():
+                    lease_path.unlink()
+                print(json.dumps({{"released": True, "lease_path": str(lease_path)}}, sort_keys=True))
+                raise SystemExit(0)
 
-        if is_active(current) and not payload["force"]:
-            print(
-                json.dumps(
-                    {{
-                        "acquired": False,
-                        "lease_path": str(lease_path),
-                        "lease": current,
-                    }},
-                    sort_keys=True,
+            if action != "acquire":
+                raise SystemExit(2)
+
+            if is_active(current) and not payload["force"]:
+                print(
+                    json.dumps(
+                        {{
+                            "acquired": False,
+                            "lease_path": str(lease_path),
+                            "lease": current,
+                        }},
+                        sort_keys=True,
+                    )
                 )
-            )
-            raise SystemExit(3)
+                raise SystemExit(3)
 
-        new_payload = payload["payload"]
-        lease_path.write_text(json.dumps(new_payload, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
-        print(json.dumps({{"acquired": True, "lease_path": str(lease_path), "lease": new_payload}}, sort_keys=True))
+            new_payload = payload["payload"]
+            lease_path.write_text(json.dumps(new_payload, indent=2, sort_keys=True) + "\\n", encoding="utf-8")
+            print(json.dumps({{"acquired": True, "lease_path": str(lease_path), "lease": new_payload}}, sort_keys=True))
+        finally:
+            try:
+                os.rmdir(lock_path)
+            except OSError:
+                pass
         """
     ).strip()
     return build_remote_script(
@@ -1420,7 +2116,9 @@ def command_rsync(args: argparse.Namespace) -> int:
     return print_command_results(results)
 
 
-def _smoke_one(machine: RemoteMachine, *, dry_run: bool) -> CommandResult:
+def _smoke_one(
+    machine: RemoteMachine, *, dry_run: bool, timeout_seconds: float
+) -> CommandResult:
     smoke = textwrap.dedent(
         """
         echo "host=$(hostname)"
@@ -1446,6 +2144,7 @@ def _smoke_one(machine: RemoteMachine, *, dry_run: bool) -> CommandResult:
         ),
         machine=machine,
         dry_run=dry_run,
+        timeout_seconds=timeout_seconds,
     )
     return CommandResult(
         machine=machine,
@@ -1466,7 +2165,11 @@ def command_smoke(args: argparse.Namespace) -> int:
     results = fanout(
         machines,
         max_parallel=args.max_parallel,
-        work=lambda machine: _smoke_one(machine, dry_run=args.dry_run),
+        work=lambda machine: _smoke_one(
+            machine,
+            dry_run=args.dry_run,
+            timeout_seconds=probe_timeout_seconds(env),
+        ),
     )
     if not args.dry_run:
         for result in results:
@@ -1524,6 +2227,8 @@ def _filter_machines_by_gpu_policy(
             require_idle=require_idle,
             min_free_vram_gib=min_free_vram_gib,
             ignore_leases=ignore_leases,
+            machine_disk=payload.get("disk"),
+            min_free_disk_gib=min_free_disk_gib(env),
         )
         if allowed:
             selected.append(machine)
@@ -1575,6 +2280,8 @@ def command_gpu_status(args: argparse.Namespace) -> int:
                 require_idle=args.require_idle,
                 min_free_vram_gib=args.min_free_vram_gib,
                 ignore_leases=args.ignore_leases,
+                machine_disk=payload.get("disk"),
+                min_free_disk_gib=min_free_disk_gib(env),
             )
             row = {
                 "machine": machine.name,
@@ -1591,12 +2298,14 @@ def command_gpu_status(args: argparse.Namespace) -> int:
                 "reasons": reasons,
                 "compute_apps": gpu.get("compute_apps", []),
                 "lease": gpu.get("lease"),
+                "disk": payload.get("disk"),
             }
             if (
                 (
                     args.require_idle
                     or args.min_free_vram_gib is not None
                     or not args.ignore_leases
+                    or min_free_disk_gib(env) > 0.0
                 )
                 and not args.all
                 and not allowed
@@ -1800,11 +2509,16 @@ def command_setup(args: argparse.Namespace) -> int:
                 "  fi",
                 '  SETUP_PYTHON="$MINIFORGE_PY"',
                 "fi",
-                '"$SETUP_PYTHON" -m venv .venv',
-                ".venv/bin/python -m pip install -U pip",
-                ".venv/bin/pip install -r requirements.txt",
+                "rm -rf .venv.tmp",
+                '"$SETUP_PYTHON" -m venv .venv.tmp',
+                ".venv.tmp/bin/python -m pip install -U pip",
+                ".venv.tmp/bin/pip install -r requirements.txt",
+                "if [ -d .venv ]; then rm -rf .venv.prev; mv .venv .venv.prev; fi",
+                "mv .venv.tmp .venv",
+                "rm -rf .venv.prev",
             ]
         install_lines += [
+            "if [ -d .remote-jobs ]; then find .remote-jobs -type f -mtime +7 -delete; fi",
             ".venv/bin/python --version",
             "if command -v nvidia-smi >/dev/null 2>&1; then "
             "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader; "
@@ -1856,6 +2570,7 @@ def command_collect(args: argparse.Namespace) -> int:
     paths = sweep_paths(env, sweep_name)
     paths.local_machine_root.mkdir(parents=True, exist_ok=True)
     paths.local_canonical_root.mkdir(parents=True, exist_ok=True)
+    known_job_ids = _known_launch_job_ids(paths.ledger_path, sweep_name=sweep_name)
 
     def work(machine: RemoteMachine) -> CommandResult:
         if machine.workdir is None:
@@ -1899,12 +2614,195 @@ def command_collect(args: argparse.Namespace) -> int:
                 "canonical_root": str(paths.local_canonical_root),
             }
             append_jsonl(paths.ledger_path, ledger_entry)
+            reconcile_result = _query_remote_done_jobs(
+                result.machine,
+                sweep_name=sweep_name,
+                dry_run=False,
+                timeout_seconds=probe_timeout_seconds(env),
+            )
+            reconciled = 0
+            if reconcile_result.returncode == 0:
+                try:
+                    payload = _extract_json_payload(
+                        reconcile_result,
+                        context="remote done job query",
+                    )
+                except RemoteConfigError:
+                    payload = {}
+                for row in payload.get("jobs", []):
+                    if not isinstance(row, dict):
+                        continue
+                    job_id = row.get("job_id")
+                    if not isinstance(job_id, str) or not job_id:
+                        continue
+                    if job_id in known_job_ids:
+                        continue
+                    reconciled_entry = {
+                        "event": "launch_reconciled",
+                        "timestamp": iso_now(),
+                        "machine": result.machine.name,
+                        "host": result.machine.host,
+                        "sweep": sweep_name,
+                        "job_id": job_id,
+                        "pid": row.get("pid"),
+                        "remote_log_path": row.get("log_path"),
+                        "launcher_path": row.get("launcher_path"),
+                        "lease_path": row.get("lease_path"),
+                        "source_done_path": row.get("done_path"),
+                    }
+                    append_jsonl(paths.ledger_path, reconciled_entry)
+                    known_job_ids.add(job_id)
+                    reconciled += 1
             update_machine_state(
                 env,
                 result.machine,
-                {"last_collect_at": iso_now(), "last_collected_sweep": sweep_name},
+                {
+                    "last_collect_at": iso_now(),
+                    "last_collected_sweep": sweep_name,
+                    "last_reconciled_launches": reconciled,
+                },
             )
     return print_command_results(results)
+
+
+def command_audit(args: argparse.Namespace) -> int:
+    env = load_remote_env(args.env_file)
+    machines = resolve_selected_machines(
+        env,
+        machine=args.machine,
+        group=args.group,
+        allow_default_single=True,
+    )
+    paths = sweep_paths(env, args.sweep)
+
+    def work(machine: RemoteMachine) -> CommandResult:
+        return _audit_remote_jobs(
+            machine,
+            sweep_name=args.sweep,
+            kill_orphans=args.kill_orphans,
+            dry_run=args.dry_run,
+            timeout_seconds=probe_timeout_seconds(env),
+        )
+
+    results = fanout(machines, max_parallel=args.max_parallel, work=work)
+    if args.dry_run:
+        return print_command_results(results)
+
+    output_rows: list[dict[str, Any]] = []
+    errors: list[CommandResult] = []
+    for result in results:
+        if result.returncode != 0:
+            errors.append(result)
+            continue
+        try:
+            payload = _extract_json_payload(result, context="remote audit")
+        except RemoteConfigError as exc:
+            errors.append(
+                CommandResult(
+                    machine=result.machine,
+                    returncode=1,
+                    stdout=result.stdout,
+                    stderr=str(exc),
+                )
+            )
+            continue
+        if not payload.get("ok", False):
+            errors.append(
+                CommandResult(
+                    machine=result.machine,
+                    returncode=1,
+                    stdout=result.stdout,
+                    stderr=str(payload.get("error", "")),
+                )
+            )
+            continue
+        dead_launches = payload.get("dead_launches", [])
+        killed_orphans = payload.get("killed_orphans", [])
+        row = {
+            "machine": result.machine.name,
+            "host": result.machine.host,
+            "sweep": args.sweep,
+            "jobs_total": payload.get("jobs_total", 0),
+            "active_launches": payload.get("active_launches", 0),
+            "dead_launches": dead_launches,
+            "dead_launch_count": len(dead_launches)
+            if isinstance(dead_launches, list)
+            else 0,
+            "stale_leases_cleared": payload.get("stale_leases_cleared", 0),
+            "killed_orphans": killed_orphans,
+            "killed_orphans_count": len(killed_orphans)
+            if isinstance(killed_orphans, list)
+            else 0,
+        }
+        output_rows.append(row)
+
+        if isinstance(dead_launches, list):
+            for launch in dead_launches:
+                if not isinstance(launch, dict):
+                    continue
+                append_jsonl(
+                    paths.ledger_path,
+                    {
+                        "event": "audit_dead_launch",
+                        "timestamp": iso_now(),
+                        "machine": result.machine.name,
+                        "host": result.machine.host,
+                        "sweep": args.sweep,
+                        "job_id": launch.get("job_id"),
+                        "pid": launch.get("pid"),
+                        "remote_log_path": launch.get("log_path"),
+                        "lease_path": launch.get("lease_path"),
+                        "source_done_path": launch.get("done_path"),
+                    },
+                )
+        if isinstance(killed_orphans, list):
+            for orphan in killed_orphans:
+                if not isinstance(orphan, dict):
+                    continue
+                append_jsonl(
+                    paths.ledger_path,
+                    {
+                        "event": "audit_killed_orphan",
+                        "timestamp": iso_now(),
+                        "machine": result.machine.name,
+                        "host": result.machine.host,
+                        "sweep": args.sweep,
+                        "pid": orphan.get("pid"),
+                        "cwd": orphan.get("cwd"),
+                        "cmdline": orphan.get("cmdline"),
+                    },
+                )
+        update_machine_state(
+            env,
+            result.machine,
+            {
+                "last_audit_at": iso_now(),
+                "last_audit_sweep": args.sweep,
+                "last_audit_dead_launches": row["dead_launch_count"],
+                "last_audit_orphans_killed": row["killed_orphans_count"],
+            },
+        )
+
+    if args.json:
+        print(json.dumps(output_rows, indent=2, sort_keys=True))
+    else:
+        for row in output_rows:
+            print(
+                " ".join(
+                    [
+                        f"machine={row['machine']}",
+                        f"sweep={row['sweep']}",
+                        f"jobs_total={row['jobs_total']}",
+                        f"active_launches={row['active_launches']}",
+                        f"dead_launches={row['dead_launch_count']}",
+                        f"stale_leases_cleared={row['stale_leases_cleared']}",
+                        f"killed_orphans={row['killed_orphans_count']}",
+                    ]
+                )
+            )
+    if errors:
+        return print_command_results(errors)
+    return 0
 
 
 def command_sweep_run(args: argparse.Namespace) -> int:
@@ -1929,6 +2827,8 @@ def command_sweep_run(args: argparse.Namespace) -> int:
             require_idle=args.require_idle,
             min_free_vram_gib=args.min_free_vram_gib,
             ignore_leases=args.ignore_leases,
+            machine_disk=payload.get("disk"),
+            min_free_disk_gib=min_free_disk_gib(env),
         )
         if not allowed:
             return print_command_results(
@@ -1998,6 +2898,7 @@ def command_sweep_run(args: argparse.Namespace) -> int:
         import os
         import shlex
         import subprocess
+        import time
         from datetime import datetime, timezone
         from pathlib import Path
 
@@ -2013,12 +2914,29 @@ def command_sweep_run(args: argparse.Namespace) -> int:
 
         lease_path = Path(payload["lease_path"])
         lease_path.parent.mkdir(parents=True, exist_ok=True)
-        current = None
-        if lease_path.is_file():
+        lock_path = Path(str(lease_path) + ".lock")
+        deadline = time.monotonic() + {DEFAULT_LEASE_LOCK_WAIT_SEC}
+
+        while True:
             try:
-                current = json.loads(lease_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                current = {{"invalid": True}}
+                os.mkdir(lock_path)
+                break
+            except FileExistsError:
+                stale_seconds = 0.0
+                try:
+                    stale_seconds = time.time() - lock_path.stat().st_mtime
+                except OSError:
+                    stale_seconds = 0.0
+                if stale_seconds > {DEFAULT_LEASE_LOCK_STALE_SEC}:
+                    try:
+                        os.rmdir(lock_path)
+                        continue
+                    except OSError:
+                        pass
+                if time.monotonic() >= deadline:
+                    print(json.dumps({{"ok": False, "error": "lease lock timeout", "lease_path": str(lease_path)}}, sort_keys=True))
+                    raise SystemExit(4)
+                time.sleep(0.05)
 
         def lease_active(entry):
             if not isinstance(entry, dict):
@@ -2034,77 +2952,104 @@ def command_sweep_run(args: argparse.Namespace) -> int:
                 parsed = parsed.replace(tzinfo=timezone.utc)
             return parsed > datetime.now(timezone.utc)
 
-        if lease_active(current) and not payload["force"]:
-            print(json.dumps({{"ok": False, "error": "active lease present", "lease": current}}, sort_keys=True))
-            raise SystemExit(3)
+        try:
+            current = None
+            if lease_path.is_file():
+                try:
+                    current = json.loads(lease_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    current = {{"invalid": True}}
 
-        log_dir = workdir / "log" / payload["log_subdir"] / payload["sweep_name"]
-        log_dir.mkdir(parents=True, exist_ok=True)
-        runner_dir = workdir / ".remote-jobs" / payload["sweep_name"]
-        runner_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"{{payload['job_id']}}.log"
-        launcher_path = runner_dir / f"{{payload['job_id']}}.sh"
-        done_path = runner_dir / f"{{payload['job_id']}}.done.json"
+            if lease_active(current) and not payload["force"]:
+                print(json.dumps({{"ok": False, "error": "active lease present", "lease": current}}, sort_keys=True))
+                raise SystemExit(3)
 
-        lease_text = json.dumps(payload["lease_payload"], indent=2, sort_keys=True)
-        argv_text = shlex.join(payload["argv"])
-        launcher = "\\n".join(
-            [
+            log_dir = workdir / "log" / payload["log_subdir"] / payload["sweep_name"]
+            log_dir.mkdir(parents=True, exist_ok=True)
+            runner_dir = workdir / ".remote-jobs" / payload["sweep_name"]
+            runner_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{{payload['job_id']}}.log"
+            launcher_path = runner_dir / f"{{payload['job_id']}}.sh"
+            done_path = runner_dir / f"{{payload['job_id']}}.done.json"
+
+            lease_text = json.dumps(payload["lease_payload"], indent=2, sort_keys=True)
+            argv_text = shlex.join(payload["argv"])
+            cleanup_lines = [f"rm -f {shlex.quote(str(lease_path))}"]
+            if launcher_cleanup_shm(env):
+                cleanup_lines.append(
+                    "find /dev/shm -maxdepth 1 -user \"$(id -u)\" "
+                    "\\( -name 'torch_*' -o -name 'pymp-*' \\) "
+                    "-exec rm -rf {{}} + 2>/dev/null || true"
+                )
+            cleanup_body = " ; ".join(cleanup_lines)
+            launcher_lines = [
                 "#!/usr/bin/env bash",
                 "set -eu",
-                f"cleanup() {{{{ rm -f {{shlex.quote(str(lease_path))}}; }}}}",
+                "cleanup() {{ " + cleanup_body + "; }}",
                 "trap cleanup EXIT",
                 f"cd {{shlex.quote(str(workdir))}}",
                 f"cat > {{shlex.quote(str(lease_path))}} <<'JSON'",
                 lease_text,
                 "JSON",
-                f"exec env CUDA_VISIBLE_DEVICES={{payload['gpu']}} " + argv_text,
             ]
-        )
-        launcher_path.write_text(launcher + "\\n", encoding="utf-8")
-        launcher_path.chmod(0o755)
+            if launcher_enable_pytorch_allocator(env):
+                launcher_lines.append(
+                    "export PYTORCH_ALLOC_CONF="
+                    '"${{PYTORCH_ALLOC_CONF:-expandable_segments:True}}"'
+                )
+            launcher_lines.append(
+                f"exec env CUDA_VISIBLE_DEVICES={{payload['gpu']}} " + argv_text
+            )
+            launcher = "\\n".join(launcher_lines)
+            launcher_path.write_text(launcher + "\\n", encoding="utf-8")
+            launcher_path.chmod(0o755)
 
-        with log_path.open("ab") as log_handle:
-            process = subprocess.Popen(
-                ["bash", str(launcher_path)],
-                cwd=str(workdir),
-                stdin=subprocess.DEVNULL,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+            with log_path.open("ab") as log_handle:
+                process = subprocess.Popen(
+                    ["bash", str(launcher_path)],
+                    cwd=str(workdir),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
 
-        done_path.write_text(
-            json.dumps(
-                {{
-                    "job_id": payload["job_id"],
-                    "pid": process.pid,
-                    "log_path": str(log_path),
-                    "launcher_path": str(launcher_path),
-                    "lease_path": str(lease_path),
-                    "launched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                }},
-                indent=2,
-                sort_keys=True,
+            done_path.write_text(
+                json.dumps(
+                    {{
+                        "job_id": payload["job_id"],
+                        "pid": process.pid,
+                        "log_path": str(log_path),
+                        "launcher_path": str(launcher_path),
+                        "lease_path": str(lease_path),
+                        "launched_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    }},
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\\n",
+                encoding="utf-8",
             )
-            + "\\n",
-            encoding="utf-8",
-        )
-        print(
-            json.dumps(
-                {{
-                    "ok": True,
-                    "job_id": payload["job_id"],
-                    "pid": process.pid,
-                    "log_path": str(log_path),
-                    "launcher_path": str(launcher_path),
-                    "lease_path": str(lease_path),
-                    "done_path": str(done_path),
-                    "argv": payload["argv"],
-                }},
-                sort_keys=True,
+            print(
+                json.dumps(
+                    {{
+                        "ok": True,
+                        "job_id": payload["job_id"],
+                        "pid": process.pid,
+                        "log_path": str(log_path),
+                        "launcher_path": str(launcher_path),
+                        "lease_path": str(lease_path),
+                        "done_path": str(done_path),
+                        "argv": payload["argv"],
+                    }},
+                    sort_keys=True,
+                )
             )
-        )
+        finally:
+            try:
+                os.rmdir(lock_path)
+            except OSError:
+                pass
         """
     ).strip()
 
@@ -2205,11 +3150,15 @@ def command_sweep_status(args: argparse.Namespace) -> int:
             trial, plan_output_root
         )
         status = "pending"
-        record_payload = None
+        status_error = None
         if record_path.is_file():
-            record_payload = load_json(record_path)
+            record_payload, status_error = load_json_safe(record_path)
             if record_payload is not None:
                 status = str(record_payload.get("status", "pending"))
+            elif status_error is not None:
+                status = "failed"
+        if status not in {"success", "failed", "pending"}:
+            status = "failed"
         summary[status] += 1
         summary["total"] += 1
         dataset_row = dataset_summary.setdefault(
@@ -2226,6 +3175,7 @@ def command_sweep_status(args: argparse.Namespace) -> int:
                 "resource_tier": trial.get("resource_tier"),
                 "status": status,
                 "record_path": str(record_path),
+                "status_error": status_error,
             }
         )
 
@@ -2535,6 +3485,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     collect_parser.add_argument("--dry-run", action="store_true")
     collect_parser.set_defaults(handler=command_collect)
+
+    audit_parser = subparsers.add_parser(
+        "audit",
+        help=(
+            "Audit remote sweep launcher state, clear stale leases for dead launches, "
+            "and optionally kill orphaned worker processes"
+        ),
+    )
+    audit_parser.add_argument("--machine", help="Machine name from the env file")
+    audit_parser.add_argument("--group", help="Operate across a configured group")
+    audit_parser.add_argument(
+        "--sweep", required=True, help="Sweep name, for example slinoss-uea-grid"
+    )
+    audit_parser.add_argument(
+        "--kill-orphans",
+        action="store_true",
+        help="Kill orphaned Python sweep processes under WORKDIR (PPID=1)",
+    )
+    audit_parser.add_argument("--json", action="store_true")
+    audit_parser.add_argument(
+        "--max-parallel", type=int, default=DEFAULT_FANOUT_PARALLELISM
+    )
+    audit_parser.add_argument("--dry-run", action="store_true")
+    audit_parser.set_defaults(handler=command_audit)
 
     sweep_run_parser = subparsers.add_parser(
         "sweep-run", help="Launch a detached remote sweep worker on one machine/GPU"
