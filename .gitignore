@@ -23,3 +23,6 @@ sweep_slinoss/smoke_timing.py
 
 #run tracking
 REMOTE_RUN_TRACKER.md
+
+#tmp
+tmp/
