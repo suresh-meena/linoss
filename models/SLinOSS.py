@@ -423,7 +423,11 @@ class SLinOSS(nn.Module):
         valid_mask = time_index.unsqueeze(0) < valid_counts.unsqueeze(1)
         return step_outputs, valid_mask
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         _require_cuda_tensor("inputs", x)
         if x.ndim != 3:
             raise ValueError(
@@ -438,6 +442,8 @@ class SLinOSS(nn.Module):
             pooled = self._mean_pool(x)
             return self.head(pooled)
 
+        if lengths is None:
+            raise ValueError("Sequence lengths are required for non-classification outputs.")
         _require_cuda_tensor("sequence lengths", lengths)
         if lengths.ndim != 1 or lengths.shape[0] != x.shape[0]:
             raise ValueError(

@@ -665,17 +665,15 @@ def _evaluate_accuracy(
     correct = torch.zeros((), device=device, dtype=torch.int64)
     total = 0
     use_amp = mixed_precision and device.type == "cuda"
-    for x, lengths, labels in batches:
+    for x, labels in batches:
         if x.device != device:
             x = x.to(device=device, non_blocking=True)
-        if lengths.device != device:
-            lengths = lengths.to(device=device, non_blocking=True)
         if labels.device != device:
             labels = labels.to(device=device, non_blocking=True)
         with torch.autocast(
             device_type=device.type, dtype=torch.float16, enabled=use_amp
         ):
-            logits = model(x, lengths)
+            logits = model(x)
         predictions = logits.argmax(dim=1)
         correct += (predictions == labels).sum()
         total += int(labels.shape[0])
@@ -1015,11 +1013,9 @@ def train_torch_model(
     try:
         for step in range(num_steps):
             model.train()
-            x, lengths, labels = next(train_batches)
+            x, labels = next(train_batches)
             if x.device != device:
                 x = x.to(device=device, non_blocking=True)
-            if lengths.device != device:
-                lengths = lengths.to(device=device, non_blocking=True)
             if labels.device != device:
                 labels = labels.to(device=device, non_blocking=True)
 
@@ -1038,7 +1034,7 @@ def train_torch_model(
                 device_type=device.type, dtype=torch.float16, enabled=use_amp
             ):
                 try:
-                    logits = model(x, lengths)
+                    logits = model(x)
                 except Exception as exc:
                     if not check_numerics:
                         raise

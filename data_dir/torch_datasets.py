@@ -57,10 +57,8 @@ def _labels_to_indices(labels: np.ndarray) -> tuple[np.ndarray, int]:
 def _to_tensor_dataset(data: np.ndarray, labels: np.ndarray) -> TensorDataset:
     data = np.ascontiguousarray(data, dtype=np.float32)
     labels = np.ascontiguousarray(labels, dtype=np.int64)
-    lengths = np.full((data.shape[0],), data.shape[1], dtype=np.int64)
     return TensorDataset(
         torch.from_numpy(data),
-        torch.from_numpy(lengths),
         torch.from_numpy(labels),
     )
 
