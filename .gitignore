@@ -8,6 +8,7 @@ __pycache__/
 .remote-state/
 .codex
 remote-downloads/
+.vscode/
 
 #Data files
 data_dir/raw/
