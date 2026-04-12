@@ -2937,6 +2937,9 @@ def command_sweep_run(args: argparse.Namespace) -> int:
     if args.force:
         remote_payload["argv"].append("--force")
 
+    cleanup_shm = launcher_cleanup_shm(env)
+    use_pytorch_allocator = launcher_enable_pytorch_allocator(env)
+
     remote_script = textwrap.dedent(
         f"""
         import json
@@ -3020,10 +3023,10 @@ def command_sweep_run(args: argparse.Namespace) -> int:
             lease_text = json.dumps(payload["lease_payload"], indent=2, sort_keys=True)
             argv_text = shlex.join(payload["argv"])
             cleanup_lines = [f"rm -f {shlex.quote(str(lease_path))}"]
-            if launcher_cleanup_shm(env):
+            if {cleanup_shm!r}:
                 cleanup_lines.append(
                     "find /dev/shm -maxdepth 1 -user \\\"$(id -u)\\\" "
-                    "\\( -name 'torch_*' -o -name 'pymp-*' \\) "
+                    "\\\\( -name 'torch_*' -o -name 'pymp-*' \\\\) "
                     "-exec rm -rf {{}} + 2>/dev/null || true"
                 )
             cleanup_body = " ; ".join(cleanup_lines)
@@ -3037,7 +3040,7 @@ def command_sweep_run(args: argparse.Namespace) -> int:
                 lease_text,
                 "JSON",
             ]
-            if launcher_enable_pytorch_allocator(env):
+            if {use_pytorch_allocator!r}:
                 launcher_lines.append(
                     "export PYTORCH_ALLOC_CONF="
                     '"${{PYTORCH_ALLOC_CONF:-expandable_segments:True}}"'
