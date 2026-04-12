@@ -690,7 +690,21 @@ def _make_optimizer(
     device: torch.device,
     logger: _RunLogger,
 ):
+    has_complex_params = any(
+        param.requires_grad and torch.is_complex(param)
+        for param in model.parameters()
+    )
     if device.type == "cuda":
+        if has_complex_params:
+            logger.log(
+                "Detected complex-valued parameters; using standard Adam "
+                "(fused Adam requires floating-point parameters only)."
+            )
+            return torch.optim.Adam(
+                model.parameters(),
+                lr=lr,
+                weight_decay=weight_decay,
+            )
         try:
             optimizer = torch.optim.Adam(
                 model.parameters(),
