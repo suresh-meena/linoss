@@ -3022,7 +3022,7 @@ def command_sweep_run(args: argparse.Namespace) -> int:
             cleanup_lines = [f"rm -f {shlex.quote(str(lease_path))}"]
             if launcher_cleanup_shm(env):
                 cleanup_lines.append(
-                    "find /dev/shm -maxdepth 1 -user \"$(id -u)\" "
+                    "find /dev/shm -maxdepth 1 -user \\\"$(id -u)\\\" "
                     "\\( -name 'torch_*' -o -name 'pymp-*' \\) "
                     "-exec rm -rf {{}} + 2>/dev/null || true"
                 )
