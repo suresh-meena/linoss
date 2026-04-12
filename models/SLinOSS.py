@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import inspect
 from importlib import import_module
 from typing import Any
 
@@ -278,26 +279,31 @@ class SLinOSSBlock(nn.Module):
             )
 
         self.norm = BatchNormEMA(d_model)
-        self.mixer = SLinOSSMixer(
-            d_model,
-            d_state=d_state,
-            expand=expand,
-            d_head=d_head,
-            d_conv=d_conv,
-            chunk_size=chunk_size,
-            scanprep_backend=CuteScanPrepBackend(),
-            cconv_backend=StrictCudaCConv1dBackend(),
-            backend=CuteScanBackend(),
-            dt_min=dt_min,
-            dt_max=dt_max,
-            dt_init_floor=dt_init_floor,
-            r_min=r_min,
-            r_max=r_max,
-            theta_bound=theta_bound,
-            k_max=k_max,
-            eps=eps,
-            normalize_bc=True,
-        )
+        mixer_kwargs = {
+            "d_state": d_state,
+            "expand": expand,
+            "d_head": d_head,
+            "d_conv": d_conv,
+            "chunk_size": chunk_size,
+            "scanprep_backend": CuteScanPrepBackend(),
+            "cconv_backend": StrictCudaCConv1dBackend(),
+            "backend": CuteScanBackend(),
+            "dt_min": dt_min,
+            "dt_max": dt_max,
+            "dt_init_floor": dt_init_floor,
+            "r_min": r_min,
+            "r_max": r_max,
+            "theta_bound": theta_bound,
+            "k_max": k_max,
+            "eps": eps,
+            "normalize_bc": True,
+        }
+        # Keep compatibility across slinoss wheel versions with differing kwargs.
+        accepted = set(inspect.signature(SLinOSSMixer.__init__).parameters)
+        filtered_kwargs = {
+            key: value for key, value in mixer_kwargs.items() if key in accepted
+        }
+        self.mixer = SLinOSSMixer(d_model, **filtered_kwargs)
         self.post_mixer_norm = (
             BatchNormEMA(d_model) if use_post_mixer_norm else nn.Identity()
         )
