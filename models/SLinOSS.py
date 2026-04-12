@@ -245,6 +245,7 @@ class SLinOSSBlock(nn.Module):
         d_conv: int,
         chunk_size: int,
         dropout: float,
+        use_post_mixer_norm: bool = False,
         ffn_mult: int = 2,
         dt_min: float = 1e-4,
         dt_max: float = 1e-1,
@@ -297,7 +298,9 @@ class SLinOSSBlock(nn.Module):
             eps=eps,
             normalize_bc=True,
         )
-        self.post_mixer_norm = BatchNormEMA(d_model)
+        self.post_mixer_norm = (
+            BatchNormEMA(d_model) if use_post_mixer_norm else nn.Identity()
+        )
         self.dropout1 = nn.Dropout(dropout)
         self.feed_forward = SiLUFeedForward(
             d_model,
@@ -336,6 +339,7 @@ class SLinOSS(nn.Module):
         d_conv: int = 4,
         chunk_size: int = 64,
         dropout: float = 0.05,
+        use_post_mixer_norm: bool = False,
         ffn_mult: int = 2,
         dt_min: float = 1e-4,
         dt_max: float = 1e-1,
@@ -369,6 +373,7 @@ class SLinOSS(nn.Module):
                     d_conv=d_conv,
                     chunk_size=chunk_size,
                     dropout=dropout,
+                    use_post_mixer_norm=use_post_mixer_norm,
                     ffn_mult=ffn_mult,
                     dt_min=dt_min,
                     dt_max=dt_max,
