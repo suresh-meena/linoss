@@ -324,8 +324,8 @@ def test_remote_setup_and_collect_dry_run_include_expected_commands(
         env_file=env_file,
     )
     assert "mkdir -p /scratch/kdrifting" in setup.stdout
-    assert ".venv.tmp/bin/pip install -r requirements.txt" in setup.stdout
-    assert "mv .venv.tmp .venv" in setup.stdout
+    assert 'if [ ! -x .venv/bin/python ]; then' in setup.stdout
+    assert ".venv/bin/python -m pip install -r requirements.txt" in setup.stdout
     assert "test -e data_dir/processed/UEA" in setup.stdout
 
     collect = _run_script(

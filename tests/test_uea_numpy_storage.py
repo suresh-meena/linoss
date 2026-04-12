@@ -82,9 +82,8 @@ def test_torch_loader_reads_numpy_backed_uea_dataset(tmp_path) -> None:
     assert len(dataset.train) == 3
     assert len(dataset.val) == 1
     assert len(dataset.test) == 1
-    sample, lengths, label = dataset.train[0]
+    sample, label = dataset.train[0]
     assert tuple(sample.shape) == (4, 2)
-    assert lengths.item() == 4
     assert label.item() in {0, 1}
 
 

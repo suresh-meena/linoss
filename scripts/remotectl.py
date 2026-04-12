@@ -23,6 +23,7 @@ GUIX_RUN = ROOT / "scripts" / "guix-run"
 KNOWN_HOSTS_FILE = ROOT / ".remote-known-hosts"
 DEFAULT_STATE_DIR = ROOT / ".remote-state"
 DEFAULT_LEASE_ROOT = "/tmp/linoss-agent-leases"
+DEFAULT_SSH_CONTROL_DIR = DEFAULT_STATE_DIR / "ssh-control"
 DEFAULT_FANOUT_PARALLELISM = 4
 DEFAULT_SSH_CONNECT_TIMEOUT_SEC = 10
 DEFAULT_SSH_SERVER_ALIVE_INTERVAL_SEC = 15
@@ -348,10 +349,15 @@ def resolve_machine(env: dict[str, str], requested: str | None) -> RemoteMachine
         field="GPU_COUNT",
         machine=name,
     )
+    default_lease_root = (
+        f"{workdir.rstrip('/')}/.remote-jobs/leases"
+        if workdir is not None
+        else DEFAULT_LEASE_ROOT
+    )
     lease_root = (
         machine_field(env, name, "LEASE_ROOT")
         or env.get("KD_REMOTE_LEASE_ROOT")
-        or DEFAULT_LEASE_ROOT
+        or default_lease_root
     )
 
     try:
@@ -500,6 +506,7 @@ def ssh_command(
     remote_command: str | None,
     allow_missing_tools: bool = False,
 ) -> list[str]:
+    DEFAULT_SSH_CONTROL_DIR.mkdir(parents=True, exist_ok=True)
     required_tools = ["ssh"]
     if uses_sshpass(machine):
         required_tools.append("sshpass")
@@ -525,6 +532,12 @@ def ssh_command(
         f"ServerAliveInterval={DEFAULT_SSH_SERVER_ALIVE_INTERVAL_SEC}",
         "-o",
         f"ServerAliveCountMax={DEFAULT_SSH_SERVER_ALIVE_COUNT_MAX}",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={DEFAULT_SSH_CONTROL_DIR / 'ssh-%C.sock'}",
+        "-o",
+        "ControlPersist=5m",
         "-p",
         str(machine.port),
     ]
@@ -540,6 +553,7 @@ def rsync_ssh_transport(
     *,
     allow_missing_tools: bool = False,
 ) -> str:
+    DEFAULT_SSH_CONTROL_DIR.mkdir(parents=True, exist_ok=True)
     parts: list[str] = []
     required_tools = ["ssh"]
     if uses_sshpass(machine):
@@ -561,6 +575,12 @@ def rsync_ssh_transport(
         f"ServerAliveInterval={DEFAULT_SSH_SERVER_ALIVE_INTERVAL_SEC}",
         "-o",
         f"ServerAliveCountMax={DEFAULT_SSH_SERVER_ALIVE_COUNT_MAX}",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        f"ControlPath={DEFAULT_SSH_CONTROL_DIR / 'ssh-%C.sock'}",
+        "-o",
+        "ControlPersist=5m",
         "-p",
         str(machine.port),
     ]
@@ -1062,12 +1082,15 @@ def _probe_gpu_status_machine(
         import json
         import os
         import pathlib
+        import shutil
         import subprocess
         import sys
 
         payload = json.loads({json.dumps(payload, sort_keys=True)!r})
 
         def run(args):
+            if shutil.which("timeout") is not None and args and args[0] == "nvidia-smi":
+                args = ["timeout", "5", *args]
             return subprocess.run(args, check=False, capture_output=True, text=True)
 
         gpu_query = run(
@@ -1612,12 +1635,21 @@ def _audit_remote_jobs(
         jobs_dir = workdir / ".remote-jobs" / sweep_name
         kill_orphans = bool(payload.get("kill_orphans", False))
 
-        def pid_alive(pid):
+        def pid_alive(pid, launcher_path=None):
             try:
                 os.kill(pid, 0)
-                return True
+                cmdline = Path(f"/proc/{{pid}}/cmdline").read_bytes().replace(b"\\x00", b" ").lower()
             except OSError:
                 return False
+            except FileNotFoundError:
+                return False
+            if launcher_path:
+                launcher_marker = str(launcher_path).encode("utf-8", "ignore").lower()
+                if launcher_marker and launcher_marker in cmdline:
+                    return True
+            if b"python" in cmdline and b"sweep" in cmdline:
+                return True
+            return False
 
         launches = []
         active_launch_pids = set()
@@ -1645,7 +1677,7 @@ def _audit_remote_jobs(
                     pid = pid_value
                 elif isinstance(pid_value, str) and pid_value.isdigit():
                     pid = int(pid_value)
-                alive = bool(pid and pid > 0 and pid_alive(pid))
+                alive = bool(pid and pid > 0 and pid_alive(pid, row.get("launcher_path")))
                 row["pid_alive"] = alive
                 if alive and pid is not None:
                     active_launch_pids.add(pid)
@@ -2009,6 +2041,7 @@ def _build_rsync_command(
     command: list[str] = command_prefix("rsync", allow_missing=allow_missing_tools) + [
         "rsync",
         "-az",
+        "--compress-level=1",
     ]
     if delete:
         command.append("--delete")
@@ -2126,7 +2159,11 @@ def _smoke_one(
         echo "user=$(whoami)"
         if command -v python3 >/dev/null 2>&1; then python3 --version; fi
         if command -v nvidia-smi >/dev/null 2>&1; then
-          nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+          if command -v timeout >/dev/null 2>&1; then
+            timeout 5 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+          else
+            nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+          fi
         fi
         """
     ).strip()
@@ -2509,19 +2546,22 @@ def command_setup(args: argparse.Namespace) -> int:
                 "  fi",
                 '  SETUP_PYTHON="$MINIFORGE_PY"',
                 "fi",
-                "rm -rf .venv.tmp",
-                '"$SETUP_PYTHON" -m venv .venv.tmp',
-                ".venv.tmp/bin/python -m pip install -U pip",
-                ".venv.tmp/bin/pip install -r requirements.txt",
-                "if [ -d .venv ]; then rm -rf .venv.prev; mv .venv .venv.prev; fi",
-                "mv .venv.tmp .venv",
-                "rm -rf .venv.prev",
+                'if [ ! -x .venv/bin/python ]; then',
+                "  rm -rf .venv",
+                '  "$SETUP_PYTHON" -m venv .venv',
+                "  .venv/bin/python -m pip install -U pip",
+                "fi",
+                ".venv/bin/python -m pip install -r requirements.txt",
             ]
         install_lines += [
             "if [ -d .remote-jobs ]; then find .remote-jobs -type f -mtime +7 -delete; fi",
             ".venv/bin/python --version",
             "if command -v nvidia-smi >/dev/null 2>&1; then "
+            "if command -v timeout >/dev/null 2>&1; then "
+            "timeout 5 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader; "
+            "else "
             "nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader; "
+            "fi; "
             "else echo 'nvidia-smi missing' >&2; exit 1; fi",
         ]
         remote_command = build_remote_script(
