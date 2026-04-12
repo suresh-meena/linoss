@@ -334,9 +334,11 @@ def _iter_tensor_batches(
         return
 
     if shuffle:
-        indices = torch.randperm(size, generator=generator)
-        if indices.device != tensors[0].device:
-            indices = indices.to(device=tensors[0].device, non_blocking=True)
+        indices = torch.randperm(
+            size,
+            generator=generator,
+            device=tensors[0].device,
+        )
         for start in range(0, limit, batch_size):
             batch_indices = indices[start : start + batch_size]
             yield tuple(
@@ -906,7 +908,11 @@ def train_torch_model(
         dataset_is_on_gpu = True
 
     pin_memory = device.type == "cuda" and not dataset_is_on_gpu
-    train_generator = torch.Generator()
+    train_generator = (
+        torch.Generator(device=device.type)
+        if dataset_is_on_gpu and device.type == "cuda"
+        else torch.Generator()
+    )
     train_generator.manual_seed(shuffle_seed)
     use_amp = mixed_precision and device.type == "cuda"
     effective_lr = lr_scheduler(lr)
