@@ -335,7 +335,7 @@ class SLinOSS(nn.Module):
         d_head: int = 64,
         d_conv: int = 4,
         chunk_size: int = 64,
-        dropout: float = 0.0,
+        dropout: float = 0.05,
         ffn_mult: int = 2,
         dt_min: float = 1e-4,
         dt_max: float = 1e-1,
