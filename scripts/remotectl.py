@@ -23,7 +23,8 @@ GUIX_RUN = ROOT / "scripts" / "guix-run"
 KNOWN_HOSTS_FILE = ROOT / ".remote-known-hosts"
 DEFAULT_STATE_DIR = ROOT / ".remote-state"
 DEFAULT_LEASE_ROOT = "/tmp/linoss-agent-leases"
-DEFAULT_SSH_CONTROL_DIR = DEFAULT_STATE_DIR / "ssh-control"
+# Keep the control socket path short enough for Unix domain socket limits.
+DEFAULT_SSH_CONTROL_DIR = Path("/tmp/linoss-ssh-control")
 DEFAULT_FANOUT_PARALLELISM = 4
 DEFAULT_SSH_CONNECT_TIMEOUT_SEC = 10
 DEFAULT_SSH_SERVER_ALIVE_INTERVAL_SEC = 15
@@ -520,6 +521,8 @@ def ssh_command(
     if allocate_tty:
         command.append("-t")
     command += [
+        "-F",
+        "/dev/null",
         "-o",
         "StrictHostKeyChecking=accept-new",
         "-o",
@@ -563,6 +566,8 @@ def rsync_ssh_transport(
         parts += ["sshpass", "-e"]
     parts += [
         "ssh",
+        "-F",
+        "/dev/null",
         "-o",
         "StrictHostKeyChecking=accept-new",
         "-o",
