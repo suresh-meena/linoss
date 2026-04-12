@@ -82,7 +82,7 @@ def _require_cuda_tensor(name: str, tensor: torch.Tensor) -> None:
 
 
 class BatchNormEMA(nn.Module):
-    """Equinox-style EMA BatchNorm over batch and time with no affine parameters."""
+    """EMA-style BatchNorm over (batch, time) for each channel."""
 
     running_mean: torch.Tensor
     running_var: torch.Tensor
@@ -94,23 +94,37 @@ class BatchNormEMA(nn.Module):
         *,
         eps: float = 1e-5,
         momentum: float = 0.99,
+        dtype: torch.dtype | None = None,
+        device: torch.device | str | None = None,
     ) -> None:
         super().__init__()
+        self.d_model = d_model
         self.eps = eps
         self.momentum = momentum
-        self.register_buffer("running_mean", torch.zeros(d_model))
-        self.register_buffer("running_var", torch.ones(d_model))
-        self.register_buffer("_initialized", torch.tensor(False, dtype=torch.bool))
+        factory_kwargs = {"device": device, "dtype": dtype}
+        self.register_buffer("running_mean", torch.zeros(d_model, **factory_kwargs))
+        self.register_buffer("running_var", torch.ones(d_model, **factory_kwargs))
+        self.register_buffer("_initialized", torch.tensor(False, dtype=torch.bool, device=device))
+
+    def reset_running_stats(self) -> None:
+        with torch.no_grad():
+            self.running_mean.zero_()
+            self.running_var.fill_(1.0)
+            self._initialized.fill_(False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 3:
             raise ValueError(
-                "BatchNormEMA expects (batch, time, channels) inputs. "
-                f"Got shape {tuple(x.shape)}."
+                f"BatchNormEMA expects input of shape (B, T, C), got {tuple(x.shape)}."
             )
         batch, timesteps, channels = x.shape
+        if channels != self.d_model:
+            raise ValueError(
+                f"Expected last dimension C={self.d_model}, got C={channels}."
+            )
+
         flat_x = x.reshape(batch * timesteps, channels)
-        stats_x = flat_x.to(dtype=torch.float32)
+        stats_x = flat_x.to(torch.float32)
 
         if self.training:
             batch_mean = stats_x.mean(dim=0)
@@ -118,27 +132,25 @@ class BatchNormEMA(nn.Module):
             batch_var = centered.square().mean(dim=0).clamp_min_(0.0)
             initialized = bool(self._initialized.item())
 
-            with torch.no_grad():
-                if initialized:
-                    self.running_mean.mul_(self.momentum).add_(
-                        batch_mean.detach(),
-                        alpha=1.0 - self.momentum,
-                    )
-                    self.running_var.mul_(self.momentum).add_(
-                        batch_var.detach(),
-                        alpha=1.0 - self.momentum,
-                    )
-                else:
-                    self.running_mean.copy_(batch_mean.detach())
-                    self.running_var.copy_(batch_var.detach())
-                    self._initialized.fill_(True)
+            if initialized:
+                mean = self.momentum * self.running_mean.to(torch.float32) + (
+                    1.0 - self.momentum
+                ) * batch_mean
+                var = self.momentum * self.running_var.to(torch.float32) + (
+                    1.0 - self.momentum
+                ) * batch_var
+            else:
+                mean = batch_mean
+                var = batch_var
 
-            mean = batch_mean
-            var = batch_var
+            with torch.no_grad():
+                self.running_mean.copy_(mean.to(self.running_mean.dtype))
+                self.running_var.copy_(var.to(self.running_var.dtype))
+                self._initialized.fill_(True)
         else:
             if bool(self._initialized.item()):
-                mean = self.running_mean
-                var = self.running_var
+                mean = self.running_mean.to(torch.float32)
+                var = self.running_var.to(torch.float32)
             else:
                 mean = stats_x.mean(dim=0)
                 centered = stats_x - mean
@@ -146,6 +158,12 @@ class BatchNormEMA(nn.Module):
 
         normalized = (stats_x - mean) / torch.sqrt(var + self.eps)
         return normalized.to(dtype=x.dtype).reshape(batch, timesteps, channels)
+
+    def extra_repr(self) -> str:
+        return (
+            f"d_model={self.d_model}, eps={self.eps}, momentum={self.momentum}, "
+            f"initialized={bool(self._initialized.item())}"
+        )
 
 class SiLUFeedForward(nn.Module):
     """Two-layer feed-forward network with SiLU activations."""
