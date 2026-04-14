@@ -13,6 +13,7 @@ from torch.nn import functional as F
 
 try:
     from slinoss.layers import CuteScanBackend, CuteScanPrepBackend, SLinOSSMixer
+    from slinoss.layers.backend import apply_cuda_causal_depthwise_conv
     from slinoss.ops.cconv1d import (
         cconv1d_cuda_supported,
         cconv1d_is_available,
@@ -22,6 +23,7 @@ except Exception as exc:  # pragma: no cover - exercised on misconfigured instal
     CuteScanBackend = None
     CuteScanPrepBackend = None
     SLinOSSMixer = None
+    apply_cuda_causal_depthwise_conv = None
     cconv1d_cuda_supported = None
     cconv1d_is_available = None
     cconv1d_load_error = None
@@ -230,7 +232,16 @@ class StrictCudaCConv1dBackend:
                 f"input dtype={x.dtype}, weight dtype={owner.dw_weight.dtype}, "
                 f"d_conv={owner.d_conv}."
             )
-        return owner._apply_cconv_cuda(x, conv_state)
+        # slinoss<=0.5 exposes owner._apply_cconv_cuda; slinoss>=0.6 moved this
+        # into a backend helper.
+        if hasattr(owner, "_apply_cconv_cuda"):
+            return owner._apply_cconv_cuda(x, conv_state)
+        if apply_cuda_causal_depthwise_conv is None:
+            raise RuntimeError(
+                "SLinOSS CUDA causal-conv apply helper is unavailable. Reinstall the "
+                "published `slinoss` wheel and verify CUDA extras import cleanly."
+            )
+        return apply_cuda_causal_depthwise_conv(owner, x, conv_state)
 
 
 class SLinOSSBlock(nn.Module):
